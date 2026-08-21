@@ -83,6 +83,10 @@ def make_router(service, repo, sender, settings, reindex_fn) -> Router:
 
     @router.message(Command("status"))
     async def cmd_status(message: Message):
+        try:
+            await service.sync_mentees()  # /status всегда по свежему листу
+        except Exception:
+            await message.answer("⚠️ Не смог перечитать таблицу — показываю по кэшу")
         await message.answer(await status_text(service, repo, settings, datetime.now(timezone.utc)))
 
     @router.message(Command("pause"))
