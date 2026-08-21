@@ -1,0 +1,44 @@
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS mentees(
+  username TEXT PRIMARY KEY,
+  chat_id INTEGER,
+  sheet_title TEXT,
+  row INTEGER,
+  paused_until TEXT,
+  unanswered_pings INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS messages(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL,
+  direction TEXT NOT NULL,
+  text TEXT NOT NULL,
+  ts TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_messages_user_ts ON messages(username, ts);
+CREATE TABLE IF NOT EXISTS pings(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL,
+  ts TEXT NOT NULL,
+  status TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS questions(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL,
+  question TEXT NOT NULL,
+  draft TEXT NOT NULL,
+  created_ts TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'open',
+  reminded INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS proposals(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL,
+  new_status TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS profiles(
+  username TEXT PRIMARY KEY,
+  summary TEXT NOT NULL,
+  updated_ts TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+"""

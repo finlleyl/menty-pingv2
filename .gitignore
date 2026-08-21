@@ -1,0 +1,12 @@
+.env
+*.db
+__pycache__/
+.venv/
+kb_data/
+.superpowers/
+*.egg-info/
+dist/
+build/
+service_account.json
+data/
+docs/superpowers/

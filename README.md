@@ -1,0 +1,36 @@
+# Mentor Bot
+
+Telegram Business бот-ассистент ментора: авто-пинги менти каждые 3 дня тишины,
+ведение Google-таблицы, черновики ответов по базе знаний курса.
+
+## Установка
+
+1. **Бот**: у @BotFather → `/newbot`, токен в `.env` (`BOT_TOKEN`).
+2. **Telegram Business** (нужен Premium): Настройки → Telegram для бизнеса → Чат-боты →
+   добавить бота, разрешить читать и отправлять сообщения.
+3. **Свой ID**: у @userinfobot, в `.env` (`MENTOR_USER_ID`).
+4. **Google**: console.cloud.google.com → проект → включить Google Sheets API →
+   Credentials → Service Account → ключ JSON → сохранить как `service_account.json`
+   рядом с docker-compose. Таблицу расшарить (Viewer недостаточно — Editor) на
+   email сервисного аккаунта (`...@...iam.gserviceaccount.com`).
+5. **OpenAI**: ключ в `.env` (`OPENAI_API_KEY`).
+6. **Edu-платформа**: логин/пароль в `.env` (`EDU_EMAIL`, `EDU_PASSWORD`) — нужны краулеру
+   для авторизации на edu-платформе при `/reindex`; без них база знаний не соберётся.
+7. `cp .env.example .env` и заполнить. `ACTIVE_SHEETS` — точные названия листов через запятую.
+8. `docker compose up -d --build`
+
+## Первый запуск
+
+- Бот стартует в **dry-run**: все пинги и черновики приходят тебе, ученикам ничего не уходит.
+- Напиши боту `/start`, затем `/reindex` (соберёт базу знаний с edu-платформы).
+- `/status` — сводка. Чаты привязываются по мере переписки; «не привязан» лечится
+  одним сообщением в чат с учеником.
+- Когда тексты устраивают: `/dryrun off`.
+
+## Команды
+
+/status, /pause @user N, /pause_all, /resume_all, /dryrun on|off, /reindex
+
+## Тесты
+
+pip install -e ".[dev]" && python -m pytest -q
