@@ -12,6 +12,14 @@ from mentor_bot.pings import effective_last_contact, should_ping
 _bg_tasks: set = set()
 
 
+def _listing(usernames: list[str], limit: int = 30) -> str:
+    if not usernames:
+        return "—"
+    shown = ", ".join("@" + u for u in usernames[:limit])
+    rest = len(usernames) - limit
+    return shown + (f" … и ещё {rest}" if rest > 0 else "")
+
+
 async def status_text(service, repo, settings, now_utc: datetime) -> str:
     tz = ZoneInfo(settings.tz_name)
     dryrun = await repo.get_setting("dryrun", "1") == "1"
@@ -34,8 +42,8 @@ async def status_text(service, repo, settings, now_utc: datetime) -> str:
     lines = [
         f"Менти в таблице: {len(service.by_username)}",
         f"dry-run: {'ON' if dryrun else 'OFF'} | pause_all: {'ON' if pause_all else 'OFF'}",
-        f"Пора пинговать ({len(due)}): " + (", ".join("@" + u for u in due[:30]) or "—"),
-        f"Чат не привязан ({len(unbound)}): " + (", ".join("@" + u for u in unbound[:30]) or "—"),
+        f"Пора пинговать ({len(due)}): " + _listing(due),
+        f"Чат не привязан ({len(unbound)}): " + _listing(unbound),
         f"Открытых вопросов: {len(open_qs)}",
     ]
     return "\n".join(lines)
