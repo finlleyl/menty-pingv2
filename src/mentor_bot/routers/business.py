@@ -30,7 +30,14 @@ def make_router(service, repo, mentor_user_id: int) -> Router:
     async def on_business_message(message: Message):
         stored = await repo.get_setting("bconn")
         if not stored or message.business_connection_id != stored:
-            return  # чужой business connection — не обрабатываем
+            # рассинхрон id (переподключение при переносе БД) или чужой канал —
+            # сообщение не обрабатываем, но громко пишем в лог, чтобы это было видно
+            log.warning(
+                "business message dropped: connection %s != stored %s "
+                "(если это твой канал — выключи/включи бота в Telegram Business)",
+                message.business_connection_id, stored or "<пусто>",
+            )
+            return
 
         text = message.text or message.caption or ""
         peer = message.chat  # личный чат ученика
