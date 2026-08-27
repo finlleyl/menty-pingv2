@@ -63,3 +63,14 @@ async def test_reindex_task_keeps_reference():
     # Allow callback to execute
     await asyncio.sleep(0)
     assert task not in commands_mod._bg_tasks
+
+
+def test_listing_truncates_with_counter():
+    from mentor_bot.routers.commands import _listing
+
+    assert _listing([]) == "—"
+    assert _listing(["a", "b"]) == "@a, @b"
+    many = [f"u{i}" for i in range(44)]
+    out = _listing(many)
+    assert "@u29" in out and "@u30" not in out
+    assert "и ещё 14" in out
