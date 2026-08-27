@@ -41,6 +41,9 @@ class FakeLLM:
     async def parse_status(self, text, current):
         return self.status
 
+    async def parse_mentor_verdict(self, text, current):
+        return StatusUpdate(new_status=None, confidence="low")
+
     async def draft_answer(self, q, chunks, profile):
         return f"ЧЕРНОВИК[{q}]"
 
@@ -197,3 +200,39 @@ async def test_on_outgoing_closes_open_question(tmp_path):
     qid = await repo.add_question("ivan", "вопрос", "черновик", "2026-08-19T09:00:00+00:00")
     await svc.on_outgoing("ivan", "ответил лично в чате", "2026-08-19T10:00:00+00:00")
     assert (await repo.get_question(qid))["state"] == "answered"
+
+
+async def test_mentor_verdict_creates_proposal_not_write(tmp_path):
+    repo, sheets, sender, svc = await make(tmp_path)
+
+    async def verdict(text, current):
+        return StatusUpdate(new_status="Спринт 4", confidence="high")
+
+    svc.llm.parse_mentor_verdict = verdict
+    await svc.on_outgoing("ivan", "сдан спринт 3, поехали дальше", "2026-08-19T10:00:00+00:00")
+    assert sheets.statuses == []                                  # автозаписи нет
+    assert (await repo.get_proposal(1))["new_status"] == "Спринт 4"
+    assert any("Сменить статус" in m[0] for m in sender.mentor_msgs)
+
+
+async def test_ordinary_mentor_message_does_not_call_llm(tmp_path):
+    repo, sheets, sender, svc = await make(tmp_path)
+
+    async def boom(text, current):
+        raise AssertionError("обычное сообщение не должно уходить в LLM")
+
+    svc.llm.parse_mentor_verdict = boom
+    await svc.on_outgoing("ivan", "глянь видео по DDD", "2026-08-19T10:00:00+00:00")
+    assert await repo.get_proposal(1) is None
+
+
+async def test_verdict_llm_failure_does_not_break_outgoing(tmp_path):
+    repo, sheets, sender, svc = await make(tmp_path)
+
+    async def boom(text, current):
+        raise RuntimeError("llm down")
+
+    svc.llm.parse_mentor_verdict = boom
+    await svc.on_outgoing("ivan", "сдан спринт 1", "2026-08-19T10:00:00+00:00")
+    # сообщение всё равно залогировано, бот не упал
+    assert (await repo.last_message_ts("ivan")) == "2026-08-19T10:00:00+00:00"

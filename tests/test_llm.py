@@ -66,3 +66,31 @@ async def test_gen_ping_market_stage_forbids_sprint():
     assert "активный поиск работы" in system
     forbidden_part = system.split("ЗАПРЕЩЕНО")[1]
     assert "спринт" in forbidden_part.lower()
+
+
+from mentor_bot.llm import looks_like_verdict
+
+
+def test_looks_like_verdict_matches_mentor_phrasing():
+    assert looks_like_verdict("сдан спринт 1, красава")
+    assert looks_like_verdict("Сдал! идёшь дальше")
+    assert looks_like_verdict("принято, закрываю спринт")
+    assert looks_like_verdict("проверил, всё ок")
+
+
+def test_looks_like_verdict_ignores_ordinary_messages():
+    assert not looks_like_verdict("привет, как дела?")
+    assert not looks_like_verdict("посмотри вот это видео по DDD")
+    assert not looks_like_verdict("давай созвон в четверг")
+
+
+async def test_parse_mentor_verdict_uses_fast_model_and_current_status():
+    fake = FakeClient([StatusUpdate(new_status="Спринт 2", confidence="high")])
+    llm = LLM("k", "smart", "fast", "emb", client=fake)
+    upd = await llm.parse_mentor_verdict("сдан спринт 1", "Спринт 1")
+    assert upd.new_status == "Спринт 2"
+    call = fake.chat.completions.calls[0]
+    assert call["model"] == "fast"
+    system = call["messages"][0]["content"]
+    assert "Спринт 1" in system            # текущий статус подставлен
+    assert "Собесы" in system              # правило перехода после 4-го спринта

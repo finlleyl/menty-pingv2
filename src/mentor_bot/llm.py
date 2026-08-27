@@ -1,3 +1,4 @@
+import re
 from typing import Literal
 
 from pydantic import BaseModel
@@ -27,11 +28,31 @@ CLASSIFY_SYS = (
 
 STATUS_SYS = (
     "Ученик написал сообщение. Текущий статус ученика в таблице ментора: «{current}». "
-    "Определи, следует ли из сообщения НОВЫЙ статус. Примеры статусов: «1 спринт»…«4 спринт», "
-    "«Собесы», «Рынок», «оффер», «приостановил», «занят». "
+    "Определи, следует ли из сообщения НОВЫЙ статус. Допустимые статусы: «Спринт 1», "
+    "«Спринт 2», «Спринт 3», «Спринт 4», «Собесы», «Рынок», «оффер», «приостановил», «занят». "
+    "Пиши статус ровно в этой форме. "
     "new_status=null, если статус не меняется. confidence=high только если из сообщения "
     "однозначно следует смена статуса; иначе low."
 )
+
+VERDICT_SYS = (
+    "Ментор написал своему ученику сообщение. Текущий статус ученика в таблице: «{current}». "
+    "Определи, следует ли из слов МЕНТОРА новый статус ученика. "
+    "Правила перехода: «сдан спринт N» → «Спринт N+1» для N = 1, 2, 3; "
+    "«сдан спринт 4» → «Собесы». "
+    "new_status=null, если ментор не выносит вердикт по спринту. "
+    "confidence=high только если вердикт однозначен."
+)
+
+# Дешёвый предфильтр: ментор пишет много, гонять модель на каждое сообщение нельзя
+_VERDICT_RE = re.compile(
+    r"сда(л|н|ла)\b|принят|зачт|провер(ил|ено)|закр(ыл|ываю) спринт", re.IGNORECASE
+)
+
+
+def looks_like_verdict(text: str) -> bool:
+    """Похоже ли сообщение ментора на вердикт по спринту."""
+    return bool(_VERDICT_RE.search(text or ""))
 
 PING_SYS = (
     "Ты пишешь ОТ ИМЕНИ ментора по Go-разработке короткий пинг ученику, который уже несколько дней "
@@ -86,6 +107,11 @@ class LLM:
     async def parse_status(self, text: str, current_status: str | None) -> StatusUpdate:
         return await self._parse(
             self.fast, STATUS_SYS.format(current=current_status or "нет"), text, StatusUpdate
+        )
+
+    async def parse_mentor_verdict(self, text: str, current_status: str | None) -> StatusUpdate:
+        return await self._parse(
+            self.fast, VERDICT_SYS.format(current=current_status or "нет"), text, StatusUpdate
         )
 
     async def gen_ping(self, display, status, recent, profile, notes=None) -> str:

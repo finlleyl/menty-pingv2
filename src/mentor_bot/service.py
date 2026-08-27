@@ -4,6 +4,8 @@ from zoneinfo import ZoneInfo
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from mentor_bot.llm import looks_like_verdict
+
 log = logging.getLogger(__name__)
 
 
@@ -64,6 +66,26 @@ class Service:
         except Exception:
             log.exception("sheet date update failed")
             await self.sender.notify_mentor(f"⚠️ Не смог обновить дату в таблице для @{username}")
+        if looks_like_verdict(text):
+            try:
+                await self._propose_from_verdict(username, text)
+            except Exception:
+                log.exception("mentor verdict parsing failed")
+
+    async def _propose_from_verdict(self, username: str, text: str):
+        """Ментор написал «сдан спринт N» — предлагаем следующий статус кнопкой."""
+        m = self.by_username.get(username)
+        if m is None:
+            return
+        upd = await self.llm.parse_mentor_verdict(text, m.status)
+        if not upd.new_status:
+            return
+        pid = await self.repo.add_proposal(username, upd.new_status)
+        await self.sender.notify_mentor(
+            f"📋 Ты написал @{username}: {text[:200]}\n"
+            f"Сменить статус на «{upd.new_status}»?",
+            reply_markup=_kb([[("Да", f"st:yes:{pid}"), ("Нет", f"st:no:{pid}")]]),
+        )
 
     async def on_incoming(self, username: str, text: str, ts_iso: str):
         await self.repo.log_message(username, "in", text, ts_iso)
