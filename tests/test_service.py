@@ -105,12 +105,24 @@ async def test_question_creates_draft(tmp_path):
     assert any("ЧЕРНОВИК" in m[0] for m in sender.mentor_msgs)
 
 
-async def test_progress_high_confidence_writes_status(tmp_path):
+async def test_progress_high_confidence_creates_proposal_not_write(tmp_path):
     repo, sheets, sender, svc = await make(
         tmp_path, kind="progress", status=StatusUpdate(new_status="Собесы", confidence="high")
     )
     await svc.on_incoming("ivan", "вышел на собесы", "2026-08-19T10:00:00+00:00")
-    assert sheets.statuses == [("ivan", "Собесы")]
+    # даже при high confidence в таблицу ничего не пишем — только предложение с кнопками
+    assert sheets.statuses == []
+    assert (await repo.get_proposal(1))["new_status"] == "Собесы"
+    assert any("уверенно" in m[0] for m in sender.mentor_msgs)
+
+
+async def test_progress_low_confidence_marks_hint(tmp_path):
+    repo, sheets, sender, svc = await make(
+        tmp_path, kind="progress", status=StatusUpdate(new_status="Собесы", confidence="low")
+    )
+    await svc.on_incoming("ivan", "мб начну собеситься", "2026-08-19T10:00:00+00:00")
+    assert sheets.statuses == []
+    assert any("под вопросом" in m[0] for m in sender.mentor_msgs)
 
 
 async def test_progress_low_confidence_creates_proposal(tmp_path):

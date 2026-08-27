@@ -88,18 +88,13 @@ class Service:
         elif kind == "progress":
             upd = await self.llm.parse_status(text, m.status if m else None)
             if upd.new_status and m is not None:
-                if upd.confidence == "high":
-                    await self.sheets.set_status(m, upd.new_status)
-                    m.status = upd.new_status
-                    await self.sender.notify_mentor(
-                        f"📋 @{username}: статус → «{upd.new_status}» (по сообщению: {text[:100]})"
-                    )
-                else:
-                    pid = await self.repo.add_proposal(username, upd.new_status)
-                    await self.sender.notify_mentor(
-                        f"📋 @{username} написал: {text[:200]}\nСменить статус на «{upd.new_status}»?",
-                        reply_markup=_kb([[("Да", f"st:yes:{pid}"), ("Нет", f"st:no:{pid}")]]),
-                    )
+                pid = await self.repo.add_proposal(username, upd.new_status)
+                hint = "уверенно" if upd.confidence == "high" else "под вопросом"
+                await self.sender.notify_mentor(
+                    f"📋 @{username} написал: {text[:200]}\n"
+                    f"Сменить статус на «{upd.new_status}»? ({hint})",
+                    reply_markup=_kb([[("Да", f"st:yes:{pid}"), ("Нет", f"st:no:{pid}")]]),
+                )
         # обновить досье после любой содержательной реплики
         if kind in ("question", "progress"):
             recent = await self.repo.recent_messages(username, limit=15)
