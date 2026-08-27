@@ -114,3 +114,13 @@ async def test_st_yes_sheet_failure_keeps_proposal(tmp_path):
     out = await handle_st_callback(f"st:yes:{pid}", repo, sender, svc)
     assert "Ошибка" in out
     assert (await repo.get_proposal(pid)) is not None   # proposal сохранён для повтора
+
+
+async def test_confirming_status_stamps_status_since(tmp_path):
+    repo, sheets, sender, svc = await make(tmp_path)
+    pid = await repo.add_proposal("ivan", "Резюме")
+    result = await handle_st_callback(f"st:yes:{pid}", repo, sender, svc)
+    assert "Резюме" in result
+    assert sheets.statuses == [("ivan", "Резюме")]
+    # момент смены статуса зафиксирован — от него считаются дни ожидания
+    assert (await repo.get_mentee("ivan"))["status_since"] is not None

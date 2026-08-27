@@ -243,3 +243,34 @@ async def test_dossier_cycle_survives_sheet_error(tmp_path):
     await dossier_cycle(svc, repo, llm, sender, Cfg2(), now_utc=NOON_UTC)
     assert written == ["petr"]                                  # цикл не остановился
     assert any("Досье" in m[0] for m in sender.mentor_msgs)
+
+
+async def test_resume_stage_also_reminds_mentor(tmp_path):
+    repo, sheets, sender, llm, svc = await make(tmp_path, mentees=[sm(status="Резюме")])
+    await repo.upsert_mentee("ivan", chat_id=1)
+    await repo.set_status_since("ivan", "2026-08-16T12:00:00+00:00")   # 4 дня до NOON_UTC
+    await repo.set_setting("dryrun", "0")
+    await repo.set_setting("bconn", "conn1")
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC)
+    assert sender.mentee_msgs == [("ivan", "ПИНГ[Иван @ivan]")]        # ученику пинг ушёл
+    reminders = [m[0] for m in sender.mentor_msgs if "резюме" in m[0].lower()]
+    assert len(reminders) == 1
+    assert "4" in reminders[0]                                          # сколько дней ждёт
+
+
+async def test_resume_reminder_without_status_since(tmp_path):
+    repo, sheets, sender, llm, svc = await make(tmp_path, mentees=[sm(status="Резюме")])
+    await repo.upsert_mentee("ivan", chat_id=1)
+    await repo.set_setting("dryrun", "0")
+    await repo.set_setting("bconn", "conn1")
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC)
+    assert any("резюме" in m[0].lower() for m in sender.mentor_msgs)
+
+
+async def test_sprint_stage_does_not_remind_mentor(tmp_path):
+    repo, sheets, sender, llm, svc = await make(tmp_path)   # sm() по умолчанию «3 спринт»
+    await repo.upsert_mentee("ivan", chat_id=1)
+    await repo.set_setting("dryrun", "0")
+    await repo.set_setting("bconn", "conn1")
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC)
+    assert not any("резюме" in m[0].lower() for m in sender.mentor_msgs)

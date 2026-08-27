@@ -16,8 +16,17 @@ class Repo:
         conn = await aiosqlite.connect(path)
         conn.row_factory = aiosqlite.Row
         await conn.executescript(SCHEMA)
+        await cls._migrate(conn)
         await conn.commit()
         return cls(conn)
+
+    @staticmethod
+    async def _migrate(conn):
+        """Догоняем схему на базах, созданных прошлыми версиями."""
+        cur = await conn.execute("PRAGMA table_info(mentees)")
+        cols = {row[1] for row in await cur.fetchall()}
+        if "status_since" not in cols:
+            await conn.execute("ALTER TABLE mentees ADD COLUMN status_since TEXT")
 
     async def close(self):
         await self._c.close()
@@ -47,6 +56,11 @@ class Repo:
 
     async def all_mentees(self):
         return await self._all("SELECT * FROM mentees")
+
+    async def set_status_since(self, username, ts_iso):
+        """Момент, когда ментор подтвердил текущий статус. От него считается ожидание."""
+        await self._exec("INSERT OR IGNORE INTO mentees(username) VALUES (?)", (username,))
+        await self._exec("UPDATE mentees SET status_since=? WHERE username=?", (ts_iso, username))
 
     async def set_pause(self, username, until_iso):
         await self._exec("UPDATE mentees SET paused_until=? WHERE username=?", (until_iso, username))

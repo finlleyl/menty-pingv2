@@ -5,7 +5,8 @@ CREATE TABLE IF NOT EXISTS mentees(
   sheet_title TEXT,
   row INTEGER,
   paused_until TEXT,
-  unanswered_pings INTEGER NOT NULL DEFAULT 0
+  unanswered_pings INTEGER NOT NULL DEFAULT 0,
+  status_since TEXT
 );
 CREATE TABLE IF NOT EXISTS messages(
   id INTEGER PRIMARY KEY AUTOINCREMENT,

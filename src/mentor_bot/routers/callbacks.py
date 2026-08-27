@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timezone
 
 from aiogram import F, Router
 from aiogram.types import CallbackQuery
@@ -42,6 +43,7 @@ async def handle_st_callback(data: str, repo, sender, service) -> str:
     except Exception:
         return "Ошибка записи в таблицу, нажми ещё раз"
     m.status = p["new_status"]
+    await repo.set_status_since(p["username"], datetime.now(timezone.utc).isoformat())
     await repo.delete_proposal(p["id"])
     return f"Статус @{p['username']} → «{p['new_status']}»"
 

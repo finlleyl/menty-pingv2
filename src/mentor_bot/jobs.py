@@ -11,6 +11,7 @@ from mentor_bot.pings import (
     in_send_window,
     should_ping,
 )
+from mentor_bot.stages import parse_stage
 
 log = logging.getLogger(__name__)
 
@@ -89,6 +90,14 @@ async def ping_cycle(service, repo, sender, llm, settings, now_utc: datetime | N
             log.exception("ping send failed for %s", username)
             errors += 1
             continue
+
+        if result in ("sent", "dry") and parse_stage(m.status) == "resume":
+            # мяч у ментора: ученику пинг, ментору напоминание, что резюме за ним
+            since = rec.get("status_since")
+            waiting = ""
+            if since:
+                waiting = f" — ждёт уже {(now_utc - _parse_iso_utc(since)).days} дн."
+            await sender.notify_mentor(f"📝 @{username} ждёт от тебя резюме{waiting}")
 
         if result == "sent":
             await repo.log_ping(username, now_utc.isoformat(), "sent")

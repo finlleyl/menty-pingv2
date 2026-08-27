@@ -66,3 +66,27 @@ async def test_stale_profiles(tmp_path):
     await repo.log_message("sveta", "in", "новое", "2026-08-27T10:00:00+00:00")
     assert sorted(await repo.stale_profiles()) == ["ivan", "sveta"]
     await repo.close()
+
+
+async def test_status_since_stamped_and_migrated(tmp_path):
+    import aiosqlite
+
+    path = str(tmp_path / "old.db")
+    # база, созданная до появления колонки status_since
+    conn = await aiosqlite.connect(path)
+    await conn.execute(
+        "CREATE TABLE mentees(username TEXT PRIMARY KEY, chat_id INTEGER, "
+        "sheet_title TEXT, row INTEGER, paused_until TEXT, "
+        "unanswered_pings INTEGER NOT NULL DEFAULT 0)"
+    )
+    await conn.execute("INSERT INTO mentees(username) VALUES ('ivan')")
+    await conn.commit()
+    await conn.close()
+
+    repo = await Repo.open(path)                       # миграция на открытии
+    assert (await repo.get_mentee("ivan"))["status_since"] is None
+    await repo.set_status_since("ivan", "2026-08-27T10:00:00+00:00")
+    assert (await repo.get_mentee("ivan"))["status_since"] == "2026-08-27T10:00:00+00:00"
+    await repo.set_status_since("petr", "2026-08-27T10:00:00+00:00")   # ещё не заведён
+    assert (await repo.get_mentee("petr"))["status_since"] == "2026-08-27T10:00:00+00:00"
+    await repo.close()
