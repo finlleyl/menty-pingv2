@@ -93,4 +93,18 @@ async def test_parse_mentor_verdict_uses_fast_model_and_current_status():
     assert call["model"] == "fast"
     system = call["messages"][0]["content"]
     assert "Спринт 1" in system            # текущий статус подставлен
-    assert "Собесы" in system              # правило перехода после 4-го спринта
+    # весь конвейер после спринтов описан в промпте
+    for stage in ("Резюме", "Легенда", "Мок", "Рынок"):
+        assert stage in system
+
+
+def test_looks_like_verdict_catches_pipeline_phrases():
+    assert looks_like_verdict("резюме готово, кидаю")
+    assert looks_like_verdict("скинул тебе резюме")
+    assert looks_like_verdict("легенда готова")
+    assert looks_like_verdict("мок прошли, идёшь на рынок")
+
+
+def test_looks_like_verdict_still_ignores_chatter():
+    assert not looks_like_verdict("напиши мне завтра")
+    assert not looks_like_verdict("какой у тебя стек на проекте?")
