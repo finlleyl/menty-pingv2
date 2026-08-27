@@ -2,6 +2,8 @@ from typing import Literal
 
 from pydantic import BaseModel
 
+from mentor_bot.stages import STAGE_LABELS, parse_stage, ping_topics
+
 
 class Classification(BaseModel):
     kind: Literal["question", "progress", "other"]
@@ -32,10 +34,14 @@ STATUS_SYS = (
 )
 
 PING_SYS = (
-    "Ты пишешь ОТ ИМЕНИ ментора по Go-разработке короткий пинг ученику, который уже несколько дней не выходил "
-    "на связь. Стиль: неформальный, дружеский, на «ты», 1-2 предложения, без смайлов-спама, без канцелярита. "
-    "Учитывай статус ученика из таблицы: «{status}» — спроси про актуальное (спринт/собесы/рынок). "
-    "Не представляйся, не пиши 'как ментор'. Верни только текст сообщения."
+    "Ты пишешь ОТ ИМЕНИ ментора по Go-разработке короткий пинг ученику, который уже несколько дней "
+    "не выходил на связь. Стиль: неформальный, дружеский, на «ты», 1-2 предложения, без смайлов-спама, "
+    "без канцелярита. Не представляйся, не пиши 'как ментор'.\n"
+    "Ученик сейчас на этапе: {stage_label}.\n"
+    "Спрашивать МОЖНО только про это: {allowed}.\n"
+    "ЗАПРЕЩЕНО спрашивать про: {forbidden}. Даже вскользь, даже одним словом, "
+    "даже как вежливый дополнительный вопрос.\n"
+    "Верни только текст сообщения."
 )
 
 DRAFT_SYS = (
@@ -82,10 +88,24 @@ class LLM:
             self.fast, STATUS_SYS.format(current=current_status or "нет"), text, StatusUpdate
         )
 
-    async def gen_ping(self, display, status, recent, profile) -> str:
-        user = f"Досье: {profile or 'нет'}\nПоследняя переписка:\n{_dialog(recent) or 'нет'}\nУченик: {display}"
+    async def gen_ping(self, display, status, recent, profile, notes=None) -> str:
+        stage = parse_stage(status)
+        allowed, forbidden = ping_topics(stage)
+        user = (
+            f"Заметки ментора: {notes or 'нет'}\n"
+            f"Досье: {profile or 'нет'}\n"
+            f"Последняя переписка:\n{_dialog(recent) or 'нет'}\n"
+            f"Ученик: {display}"
+        )
         out: PlainText = await self._parse(
-            self.smart, PING_SYS.format(status=status or "неизвестен"), user, PlainText
+            self.smart,
+            PING_SYS.format(
+                stage_label=STAGE_LABELS[stage],
+                allowed="; ".join(allowed),
+                forbidden="; ".join(forbidden),
+            ),
+            user,
+            PlainText,
         )
         return out.text
 

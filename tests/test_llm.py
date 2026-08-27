@@ -1,4 +1,4 @@
-from mentor_bot.llm import LLM, Classification, StatusUpdate
+from mentor_bot.llm import LLM, Classification, PlainText, StatusUpdate
 
 
 class FakeCompletions:
@@ -43,3 +43,26 @@ async def test_classify_and_status():
     assert upd.new_status == "Собесы" and upd.confidence == "high"
     # классификация должна идти на быстрой модели
     assert fake.chat.completions.calls[0]["model"] == "fast"
+
+
+async def test_gen_ping_injects_stage_gate():
+    fake = FakeClient([PlainText(text="как спринт?")])
+    llm = LLM("k", "smart", "fast", "emb", client=fake)
+    await llm.gen_ping("Иван @ivan", "Спринт 2", [], None)
+    system = fake.chat.completions.calls[0]["messages"][0]["content"]
+    # промпт должен явно запрещать собесы и рынок ученику со 2-го спринта
+    assert "собеседован" in system.lower()
+    assert "ЗАПРЕЩЕНО" in system
+    assert "2-й спринт" in system
+    # генерация пинга идёт на умной модели
+    assert fake.chat.completions.calls[0]["model"] == "smart"
+
+
+async def test_gen_ping_market_stage_forbids_sprint():
+    fake = FakeClient([PlainText(text="как отклики?")])
+    llm = LLM("k", "smart", "fast", "emb", client=fake)
+    await llm.gen_ping("Иван @ivan", "Поиск работы", [], None)
+    system = fake.chat.completions.calls[0]["messages"][0]["content"]
+    assert "активный поиск работы" in system
+    forbidden_part = system.split("ЗАПРЕЩЕНО")[1]
+    assert "спринт" in forbidden_part.lower()
