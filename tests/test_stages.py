@@ -42,11 +42,17 @@ def test_sprint_stages_forbid_market_talk():
         assert any("спринт" in a.lower() for a in allowed)
 
 
-def test_sprint4_allows_resume_and_hr():
+def test_sprint4_is_still_learning():
+    # 4-й спринт — учёба: резюме, легенда и HR туда не лезут
     allowed, forbidden = ping_topics("sprint4")
     joined_allowed = " ".join(allowed).lower()
-    assert "резюме" in joined_allowed and "hr" in joined_allowed
-    assert any("оффер" in f.lower() for f in forbidden)
+    joined_forbidden = " ".join(forbidden).lower()
+    assert "резюме" not in joined_allowed and "hr" not in joined_allowed
+    assert "резюме" in joined_forbidden
+    assert "легенд" in joined_forbidden
+    assert "hr" in joined_forbidden
+    assert "оффер" in joined_forbidden
+    assert ping_topics("sprint4") == ping_topics("sprint1")   # спринт есть спринт
 
 
 def test_market_stage_forbids_sprint_talk():
@@ -71,3 +77,41 @@ def test_ping_topics_never_raises_on_any_stage():
     for stage in STAGE_LABELS:
         allowed, forbidden = ping_topics(stage)
         assert isinstance(allowed, list) and isinstance(forbidden, list)
+
+
+def test_parse_stage_pipeline_after_sprints():
+    assert parse_stage("Резюме") == "resume"
+    assert parse_stage("резюме") == "resume"
+    assert parse_stage("Легенда") == "legend"
+    assert parse_stage("легенду пишет") == "legend"
+    assert parse_stage("Мок") == "mock"
+    assert parse_stage("мок-собес") == "mock"      # «мок» важнее «собес»
+
+
+def test_resume_stage_waits_on_mentor():
+    allowed, forbidden = ping_topics("resume")
+    joined_allowed = " ".join(allowed).lower()
+    joined_forbidden = " ".join(forbidden).lower()
+    assert "резюме" in joined_allowed              # можно сказать, что резюме готовится
+    assert "спринт" in joined_forbidden and "собес" in joined_forbidden
+    assert "легенд" in joined_forbidden            # легенда — следующий шаг, не этот
+
+
+def test_legend_stage_asks_about_legend():
+    allowed, forbidden = ping_topics("legend")
+    assert any("легенд" in a.lower() for a in allowed)
+    joined_forbidden = " ".join(forbidden).lower()
+    assert "собес" in joined_forbidden and "рынок" in joined_forbidden
+    assert "спринт" in joined_forbidden
+
+
+def test_mock_stage_asks_about_the_mock():
+    allowed, forbidden = ping_topics("mock")
+    assert any("мок" in a.lower() for a in allowed)
+    joined_forbidden = " ".join(forbidden).lower()
+    assert "рынок" in joined_forbidden and "оффер" in joined_forbidden
+
+
+def test_new_stages_have_labels():
+    for stage in ("resume", "legend", "mock"):
+        assert STAGE_LABELS[stage]
