@@ -53,3 +53,74 @@ async def test_last_out_ts_ignores_incoming(tmp_path):
     await repo.log_message("ivan", "in", "спасибо", "2026-08-27T10:02:00+00:00")
     assert await repo.last_out_ts("ivan") == "2026-08-27T10:01:00+00:00"
     await repo.close()
+
+
+from datetime import datetime, timezone
+
+from mentor_bot.jobs import drain_pending
+from mentor_bot.service import Service
+from tests.test_commands import Cfg
+from tests.test_service import FakeKB, FakeLLM, FakeSender, FakeSheets, sm
+
+
+class Cfg3(Cfg):
+    debounce_minutes = 5
+
+
+NOW = datetime(2026, 8, 27, 10, 10, tzinfo=timezone.utc)
+
+
+async def make_svc(tmp_path, kind="question"):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    sender = FakeSender()
+    svc = Service(repo, FakeSheets([sm()]), FakeLLM(kind), sender, FakeKB(), Cfg3())
+    await svc.sync_mentees()
+    return repo, sender, svc
+
+
+async def test_drain_merges_texts_into_one_llm_call(tmp_path):
+    repo, sender, svc = await make_svc(tmp_path)
+    seen = []
+
+    async def classify(text):
+        seen.append(text)
+        return "question"
+
+    svc.llm.classify = classify
+    await repo.buffer_incoming("ivan", "привет", "2026-08-27T10:00:00+00:00")
+    await repo.buffer_incoming("ivan", "как работает select?", "2026-08-27T10:00:30+00:00")
+    await drain_pending(svc, repo, sender, Cfg3(), now_utc=NOW)
+    assert seen == ["привет\nкак работает select?"]     # один вызов, склеенный текст
+    assert await repo.get_pending("ivan") is None
+
+
+async def test_drain_skips_unripe_buffer(tmp_path):
+    repo, sender, svc = await make_svc(tmp_path)
+    await repo.buffer_incoming("ivan", "только что", "2026-08-27T10:08:00+00:00")
+    await drain_pending(svc, repo, sender, Cfg3(), now_utc=NOW)
+    assert await repo.get_pending("ivan") is not None   # окно ещё не закрылось
+    assert await repo.open_questions() == []
+
+
+async def test_drain_cancels_when_mentor_answered_in_between(tmp_path):
+    repo, sender, svc = await make_svc(tmp_path)
+    await repo.buffer_incoming("ivan", "вопрос", "2026-08-27T10:00:00+00:00")
+    # ментор ответил уже после последнего входящего — черновик не нужен
+    await repo.log_message("ivan", "out", "уже ответил", "2026-08-27T10:03:00+00:00")
+    await drain_pending(svc, repo, sender, Cfg3(), now_utc=NOW)
+    assert await repo.get_pending("ivan") is None
+    assert await repo.open_questions() == []
+
+
+async def test_drain_clears_buffer_even_when_handling_raises(tmp_path):
+    repo, sender, svc = await make_svc(tmp_path)
+
+    async def boom(text):
+        raise RuntimeError("llm down")
+
+    svc.llm.classify = boom
+    await repo.buffer_incoming("ivan", "вопрос", "2026-08-27T10:00:00+00:00")
+    await drain_pending(svc, repo, sender, Cfg3(), now_utc=NOW)
+    # буфер снят, иначе сломанное сообщение дренажилось бы каждую минуту вечно
+    assert await repo.get_pending("ivan") is None
+    assert any("⚠️" in m[0] for m in sender.mentor_msgs)

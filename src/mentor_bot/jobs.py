@@ -1,10 +1,16 @@
 import asyncio
+import json
 import logging
 import random
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from mentor_bot.pings import effective_last_contact, in_send_window, should_ping
+from mentor_bot.pings import (
+    _parse_iso_utc,
+    effective_last_contact,
+    in_send_window,
+    should_ping,
+)
 
 log = logging.getLogger(__name__)
 
@@ -108,6 +114,27 @@ async def ping_cycle(service, repo, sender, llm, settings, now_utc: datetime | N
     if errors:
         await sender.notify_mentor(f"⚠️ Цикл пингов: {errors} ошибок, детали в логах")
 
+
+
+async def drain_pending(service, repo, sender, settings, now_utc: datetime | None = None):
+    """Разбирает буферы, в которые ученик не писал дольше окна дебаунса."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+    before = (now_utc - timedelta(minutes=settings.debounce_minutes)).isoformat()
+    for row in await repo.mature_pending(before):
+        username = row["username"]
+        last_out = await repo.last_out_ts(username)
+        if last_out and _parse_iso_utc(last_out) > _parse_iso_utc(row["last_in_ts"]):
+            # ментор ответил сам, пока буфер зрел — LLM не трогаем
+            await repo.drop_pending(username)
+            continue
+        text = "\n".join(json.loads(row["texts"]))
+        try:
+            await service.handle_buffered(username, text, row["last_in_ts"])
+        except Exception:
+            log.exception("drain failed for %s", username)
+            await sender.notify_mentor(f"⚠️ Ошибка обработки сообщений @{username}: {text[:100]}")
+        finally:
+            await repo.drop_pending(username)
 
 async def remind_cycle(repo, sender, now_utc: datetime | None = None, settings=None):
     now_utc = now_utc or datetime.now(timezone.utc)

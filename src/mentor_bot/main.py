@@ -4,7 +4,7 @@ import logging
 from aiogram import Bot, Dispatcher
 
 from mentor_bot.config import load_settings
-from mentor_bot.jobs import ping_cycle, remind_cycle
+from mentor_bot.jobs import drain_pending, ping_cycle, remind_cycle
 from mentor_bot.kb import KBIndex, crawl, split_markdown
 from mentor_bot.llm import LLM
 from mentor_bot.routers import business, callbacks, commands
@@ -74,6 +74,9 @@ async def main():
                       max_instances=1, coalesce=True)
     scheduler.add_job(remind_cycle, "cron", minute="*/30", args=[repo, sender],
                       kwargs={"settings": settings}, max_instances=1)
+    scheduler.add_job(drain_pending, "cron", minute="*",
+                      args=[service, repo, sender, settings],
+                      max_instances=1, coalesce=True)
     scheduler.start()
 
     log.info("starting polling")
