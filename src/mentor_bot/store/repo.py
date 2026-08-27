@@ -1,4 +1,6 @@
+import json
 import os
+
 import aiosqlite
 
 from .db import SCHEMA
@@ -67,6 +69,14 @@ class Repo:
     async def last_message_ts(self, username):
         row = await self._one(
             "SELECT ts FROM messages WHERE username=? ORDER BY ts DESC LIMIT 1", (username,)
+        )
+        return row["ts"] if row else None
+
+    async def last_out_ts(self, username):
+        row = await self._one(
+            "SELECT ts FROM messages WHERE username=? AND direction='out' "
+            "ORDER BY ts DESC LIMIT 1",
+            (username,),
         )
         return row["ts"] if row else None
 
@@ -158,4 +168,31 @@ class Repo:
             "INSERT INTO settings(key, value) VALUES (?,?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (key, value),
+        )
+
+    # pending — буфер входящих до дебаунса
+    async def buffer_incoming(self, username, text, ts_iso):
+        row = await self._one("SELECT texts FROM pending WHERE username=?", (username,))
+        texts = json.loads(row["texts"]) if row else []
+        texts.append(text)
+        await self._exec(
+            "INSERT INTO pending(username, last_in_ts, texts) VALUES (?,?,?) "
+            "ON CONFLICT(username) DO UPDATE SET "
+            "last_in_ts=excluded.last_in_ts, texts=excluded.texts",
+            (username, ts_iso, json.dumps(texts, ensure_ascii=False)),
+        )
+
+    async def touch_pending(self, username, ts_iso):
+        """Продлить окно, не добавляя текст (медиа без подписи). Нет буфера — no-op."""
+        await self._exec("UPDATE pending SET last_in_ts=? WHERE username=?", (ts_iso, username))
+
+    async def get_pending(self, username):
+        return await self._one("SELECT * FROM pending WHERE username=?", (username,))
+
+    async def drop_pending(self, username):
+        await self._exec("DELETE FROM pending WHERE username=?", (username,))
+
+    async def mature_pending(self, before_iso):
+        return await self._all(
+            "SELECT * FROM pending WHERE last_in_ts < ? ORDER BY last_in_ts", (before_iso,)
         )

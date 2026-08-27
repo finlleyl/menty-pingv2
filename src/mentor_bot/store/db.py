@@ -40,5 +40,10 @@ CREATE TABLE IF NOT EXISTS profiles(
   summary TEXT NOT NULL,
   updated_ts TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS pending(
+  username   TEXT PRIMARY KEY,
+  last_in_ts TEXT NOT NULL,
+  texts      TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
