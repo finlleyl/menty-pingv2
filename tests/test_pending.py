@@ -124,3 +124,36 @@ async def test_drain_clears_buffer_even_when_handling_raises(tmp_path):
     # буфер снят, иначе сломанное сообщение дренажилось бы каждую минуту вечно
     assert await repo.get_pending("ivan") is None
     assert any("⚠️" in m[0] for m in sender.mentor_msgs)
+
+
+async def test_drain_keeps_messages_that_arrived_during_processing(tmp_path):
+    repo, sender, svc = await make_svc(tmp_path)
+    original = svc.handle_buffered
+
+    async def slow(username, text, ts):
+        # пока идёт запрос в LLM, ученик дописал ещё одно сообщение
+        await repo.buffer_incoming(username, "а ещё вопрос", "2026-08-27T10:09:00+00:00")
+        return await original(username, text, ts)
+
+    svc.handle_buffered = slow
+    await repo.buffer_incoming("ivan", "вопрос", "2026-08-27T10:00:00+00:00")
+    await drain_pending(svc, repo, sender, Cfg3(), now_utc=NOW)
+    row = await repo.get_pending("ivan")
+    assert row is not None                                    # новое сообщение не потеряно
+    assert json.loads(row["texts"]) == ["а ещё вопрос"]        # обработанное убрано, дублей не будет
+    assert row["last_in_ts"] == "2026-08-27T10:09:00+00:00"
+
+
+async def test_drain_keeps_late_message_even_when_handling_raises(tmp_path):
+    repo, sender, svc = await make_svc(tmp_path)
+
+    async def boom(username, text, ts):
+        await repo.buffer_incoming(username, "а ещё вопрос", "2026-08-27T10:09:00+00:00")
+        raise RuntimeError("llm down")
+
+    svc.handle_buffered = boom
+    await repo.buffer_incoming("ivan", "вопрос", "2026-08-27T10:00:00+00:00")
+    await drain_pending(svc, repo, sender, Cfg3(), now_utc=NOW)
+    row = await repo.get_pending("ivan")
+    # сломанное сообщение выброшено, свежее осталось — цикла не будет
+    assert json.loads(row["texts"]) == ["а ещё вопрос"]

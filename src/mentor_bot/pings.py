@@ -2,7 +2,7 @@ from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 
-def _parse_iso_utc(s: str) -> datetime:
+def parse_iso_utc(s: str) -> datetime:
     """ISO-8601 → aware UTC; naive strings are treated as UTC."""
     dt = datetime.fromisoformat(s)
     if dt.tzinfo is None:
@@ -17,7 +17,7 @@ def effective_last_contact(sheet_date, last_msg_iso, tz: ZoneInfo):
             datetime.combine(sheet_date, time(23, 59), tzinfo=tz).astimezone(timezone.utc)
         )
     if last_msg_iso:
-        candidates.append(_parse_iso_utc(last_msg_iso))
+        candidates.append(parse_iso_utc(last_msg_iso))
     return max(candidates) if candidates else None
 
 
@@ -40,6 +40,6 @@ def should_ping(*, last_contact, status, now_utc, stop_list, interval_days,
         return False
     if unanswered >= max_unanswered:
         return False
-    if paused_until_iso and _parse_iso_utc(paused_until_iso) > now_utc:
+    if paused_until_iso and parse_iso_utc(paused_until_iso) > now_utc:
         return False
     return now_utc - last_contact >= timedelta(days=interval_days)

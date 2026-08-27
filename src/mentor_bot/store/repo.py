@@ -216,6 +216,25 @@ class Repo:
     async def drop_pending(self, username):
         await self._exec("DELETE FROM pending WHERE username=?", (username,))
 
+    async def consume_pending(self, username, consumed: int):
+        """Снять с буфера первые `consumed` сообщений.
+
+        Пока дренаж ждал ответа модели, ученик мог дописать ещё — их допишет
+        buffer_incoming в ту же строку. Удалять строку целиком нельзя (потеряем
+        свежее), оставлять целиком тоже (обработанное уйдёт в модель второй раз).
+        """
+        row = await self._one("SELECT texts FROM pending WHERE username=?", (username,))
+        if row is None:
+            return
+        rest = json.loads(row["texts"])[consumed:]
+        if rest:
+            await self._exec(
+                "UPDATE pending SET texts=? WHERE username=?",
+                (json.dumps(rest, ensure_ascii=False), username),
+            )
+        else:
+            await self._exec("DELETE FROM pending WHERE username=?", (username,))
+
     async def mature_pending(self, before_iso):
         return await self._all(
             "SELECT * FROM pending WHERE last_in_ts < ? ORDER BY last_in_ts", (before_iso,)

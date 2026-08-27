@@ -6,9 +6,9 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from mentor_bot.pings import (
-    _parse_iso_utc,
     effective_last_contact,
     in_send_window,
+    parse_iso_utc,
     should_ping,
 )
 from mentor_bot.stages import parse_stage
@@ -96,7 +96,7 @@ async def ping_cycle(service, repo, sender, llm, settings, now_utc: datetime | N
             since = rec.get("status_since")
             waiting = ""
             if since:
-                waiting = f" — ждёт уже {(now_utc - _parse_iso_utc(since)).days} дн."
+                waiting = f" — ждёт уже {(now_utc - parse_iso_utc(since)).days} дн."
             await sender.notify_mentor(f"📝 @{username} ждёт от тебя резюме{waiting}")
 
         if result == "sent":
@@ -132,18 +132,20 @@ async def drain_pending(service, repo, sender, settings, now_utc: datetime | Non
     for row in await repo.mature_pending(before):
         username = row["username"]
         last_out = await repo.last_out_ts(username)
-        if last_out and _parse_iso_utc(last_out) > _parse_iso_utc(row["last_in_ts"]):
+        if last_out and parse_iso_utc(last_out) > parse_iso_utc(row["last_in_ts"]):
             # ментор ответил сам, пока буфер зрел — LLM не трогаем
             await repo.drop_pending(username)
             continue
-        text = "\n".join(json.loads(row["texts"]))
+        texts = json.loads(row["texts"])
+        text = "\n".join(texts)
         try:
             await service.handle_buffered(username, text, row["last_in_ts"])
         except Exception:
             log.exception("drain failed for %s", username)
             await sender.notify_mentor(f"⚠️ Ошибка обработки сообщений @{username}: {text[:100]}")
         finally:
-            await repo.drop_pending(username)
+            # снимаем ровно то, что обработали: дописанное за это время останется
+            await repo.consume_pending(username, len(texts))
 
 async def remind_cycle(repo, sender, now_utc: datetime | None = None, settings=None):
     now_utc = now_utc or datetime.now(timezone.utc)
@@ -179,8 +181,10 @@ async def dossier_cycle(service, repo, llm, sender, settings, now_utc: datetime 
             recent = await repo.recent_messages(username, limit=30)
             old = await repo.get_profile(username)
             summary = await llm.update_profile(old, recent, m.notes)
-            await repo.set_profile(username, summary, now_utc.isoformat())
+            # сначала таблица: упадёт запись — досье останется устаревшим и попадёт
+            # в следующий цикл, а не «протухнет» молча при молчащем ученике
             await service.sheets.set_dossier(m, summary)
+            await repo.set_profile(username, summary, now_utc.isoformat())
         except Exception:
             log.exception("dossier update failed for %s", username)
             errors += 1

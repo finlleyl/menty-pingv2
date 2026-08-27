@@ -274,3 +274,24 @@ async def test_sprint_stage_does_not_remind_mentor(tmp_path):
     await repo.set_setting("bconn", "conn1")
     await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC)
     assert not any("резюме" in m[0].lower() for m in sender.mentor_msgs)
+
+
+async def test_dossier_cycle_leaves_profile_stale_when_sheet_write_fails(tmp_path):
+    from mentor_bot.jobs import dossier_cycle
+
+    repo, sheets, sender, llm, svc = await make(tmp_path)
+
+    async def set_dossier(m, text):
+        raise RuntimeError("sheets down")
+
+    sheets.set_dossier = set_dossier
+
+    async def update_profile(old, recent, notes=None):
+        return "досье"
+
+    llm.update_profile = update_profile
+    await repo.log_message("ivan", "in", "привет", "2026-08-27T10:00:00+00:00")
+    await dossier_cycle(svc, repo, llm, sender, Cfg2(), now_utc=NOON_UTC)
+    # запись в таблицу не прошла — досье не помечено свежим, завтра попробуем снова
+    assert await repo.get_profile("ivan") is None
+    assert await repo.stale_profiles() == ["ivan"]
