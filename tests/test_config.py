@@ -12,3 +12,14 @@ def test_settings_from_env(monkeypatch):
     assert s.active_sheet_titles == ["A", "B"]
     assert "оффер" in s.stop_status_list
     assert s.ping_interval_days == 3
+
+
+def test_new_defaults(monkeypatch):
+    monkeypatch.setenv("BOT_TOKEN", "t")
+    monkeypatch.setenv("MENTOR_USER_ID", "1")
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    monkeypatch.setenv("SPREADSHEET_ID", "s")
+    monkeypatch.setenv("ACTIVE_SHEETS", "A")
+    s = Settings(_env_file=None)
+    assert s.debounce_minutes == 5
+    assert s.dossier_hour == 3

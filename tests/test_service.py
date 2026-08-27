@@ -1,3 +1,4 @@
+import json
 from datetime import date
 
 from mentor_bot.llm import StatusUpdate
@@ -97,19 +98,49 @@ async def test_incoming_older_than_sheet_no_write(tmp_path):
     assert sheets.dates == []
 
 
-async def test_question_creates_draft(tmp_path):
+async def test_incoming_buffers_and_never_calls_llm(tmp_path):
     repo, sheets, sender, svc = await make(tmp_path, kind="question")
+
+    async def boom(text):
+        raise AssertionError("on_incoming не должен трогать LLM")
+
+    svc.llm.classify = boom
     await svc.on_incoming("ivan", "что такое mutex?", "2026-08-19T10:00:00+00:00")
+    row = await repo.get_pending("ivan")
+    assert json.loads(row["texts"]) == ["что такое mutex?"]
+    assert await repo.open_questions() == []
+
+
+async def test_handle_buffered_creates_draft(tmp_path):
+    repo, sheets, sender, svc = await make(tmp_path, kind="question")
+    await svc.handle_buffered("ivan", "что такое mutex?", "2026-08-19T10:00:00+00:00")
     qs = await repo.open_questions()
     assert len(qs) == 1 and qs[0]["draft"] == "ЧЕРНОВИК[что такое mutex?]"
     assert any("ЧЕРНОВИК" in m[0] for m in sender.mentor_msgs)
+
+
+async def test_outgoing_drops_pending_buffer(tmp_path):
+    repo, sheets, sender, svc = await make(tmp_path)
+    await svc.on_incoming("ivan", "вопрос", "2026-08-19T10:00:00+00:00")
+    assert await repo.get_pending("ivan") is not None
+    await svc.on_outgoing("ivan", "уже ответил", "2026-08-19T10:01:00+00:00")
+    assert await repo.get_pending("ivan") is None
+
+
+async def test_contact_only_extends_window_without_text(tmp_path):
+    repo, sheets, sender, svc = await make(tmp_path)
+    await svc.on_incoming("ivan", "смотри", "2026-08-19T10:00:00+00:00")
+    await svc.on_contact_only("ivan", "in", "2026-08-19T10:02:00+00:00")
+    row = await repo.get_pending("ivan")
+    assert row["last_in_ts"] == "2026-08-19T10:02:00+00:00"
+    assert json.loads(row["texts"]) == ["смотри"]
 
 
 async def test_progress_high_confidence_creates_proposal_not_write(tmp_path):
     repo, sheets, sender, svc = await make(
         tmp_path, kind="progress", status=StatusUpdate(new_status="Собесы", confidence="high")
     )
-    await svc.on_incoming("ivan", "вышел на собесы", "2026-08-19T10:00:00+00:00")
+    await svc.handle_buffered("ivan", "вышел на собесы", "2026-08-19T10:00:00+00:00")
     # даже при high confidence в таблицу ничего не пишем — только предложение с кнопками
     assert sheets.statuses == []
     assert (await repo.get_proposal(1))["new_status"] == "Собесы"
@@ -120,7 +151,7 @@ async def test_progress_low_confidence_marks_hint(tmp_path):
     repo, sheets, sender, svc = await make(
         tmp_path, kind="progress", status=StatusUpdate(new_status="Собесы", confidence="low")
     )
-    await svc.on_incoming("ivan", "мб начну собеситься", "2026-08-19T10:00:00+00:00")
+    await svc.handle_buffered("ivan", "мб начну собеситься", "2026-08-19T10:00:00+00:00")
     assert sheets.statuses == []
     assert any("под вопросом" in m[0] for m in sender.mentor_msgs)
 
@@ -129,7 +160,7 @@ async def test_progress_low_confidence_creates_proposal(tmp_path):
     repo, sheets, sender, svc = await make(
         tmp_path, kind="progress", status=StatusUpdate(new_status="Собесы", confidence="low")
     )
-    await svc.on_incoming("ivan", "мб начну собеситься", "2026-08-19T10:00:00+00:00")
+    await svc.handle_buffered("ivan", "мб начну собеситься", "2026-08-19T10:00:00+00:00")
     assert sheets.statuses == []
     assert (await repo.get_proposal(1))["new_status"] == "Собесы"
 
@@ -147,18 +178,6 @@ async def test_outgoing_updates_and_alerts_on_sheet_failure(tmp_path):
     assert (await repo.last_message_ts("ivan")) == "2026-08-19T10:00:00+00:00"
     assert (await repo.get_mentee("ivan"))["unanswered_pings"] == 0
     assert any("⚠️" in m[0] for m in sender.mentor_msgs)
-
-
-async def test_other_message_does_not_update_profile(tmp_path):
-    repo, sheets, sender, svc = await make(tmp_path)  # kind="other" по умолчанию
-    await svc.on_incoming("ivan", "ок", "2026-08-19T10:00:00+00:00")
-    assert await repo.get_profile("ivan") is None
-
-
-async def test_question_updates_profile(tmp_path):
-    repo, sheets, sender, svc = await make(tmp_path, kind="question")
-    await svc.on_incoming("ivan", "что такое mutex?", "2026-08-19T10:00:00+00:00")
-    assert await repo.get_profile("ivan") == "досье"
 
 
 async def test_on_contact_only_updates_date_resets_and_logs(tmp_path):

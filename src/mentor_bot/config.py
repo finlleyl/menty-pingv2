@@ -23,6 +23,8 @@ class Settings(BaseSettings):
     quiet_start_hour: int = 11
     quiet_end_hour: int = 20
     max_unanswered_pings: int = 3
+    debounce_minutes: int = 5
+    dossier_hour: int = 3
     stop_statuses: str = "умер,оффер,приостановил,договор,ушел,ушёл,на стопе"
     log_level: str = "INFO"
 

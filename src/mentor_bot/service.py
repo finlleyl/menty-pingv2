@@ -47,11 +47,18 @@ class Service:
             await self._touch_sheet_date(username, ts_iso)
         except Exception:
             log.exception("sheet date update failed")
+        if direction == "in":
+            # ученик ещё пишет — продлеваем окно дебаунса, если буфер уже открыт
+            await self.repo.touch_pending(username, ts_iso)
+        else:
+            await self.repo.drop_pending(username)
 
     async def on_outgoing(self, username: str, text: str, ts_iso: str):
         await self.repo.log_message(username, "out", text, ts_iso)
         await self.repo.reset_unanswered(username)
         await self.repo.close_open_questions(username)
+        # ментор ответил сам — накопленное обрабатывать не нужно
+        await self.repo.drop_pending(username)
         try:
             await self._touch_sheet_date(username, ts_iso)
         except Exception:
@@ -66,13 +73,11 @@ class Service:
         except Exception:
             log.exception("sheet date update failed")
             await self.sender.notify_mentor(f"⚠️ Не смог обновить дату в таблице для @{username}")
-        try:
-            await self._handle_content(username, text, ts_iso)
-        except Exception:
-            log.exception("llm handling failed")
-            await self.sender.notify_mentor(f"⚠️ Ошибка обработки сообщения @{username}: {text[:100]}")
+        # LLM здесь НЕ дёргаем: копим в буфер, обработает drain_pending
+        await self.repo.buffer_incoming(username, text, ts_iso)
 
-    async def _handle_content(self, username: str, text: str, ts_iso: str):
+    async def handle_buffered(self, username: str, text: str, ts_iso: str):
+        """Разбор накопленного за окно дебаунса. Вызывается джобом drain_pending."""
         kind = await self.llm.classify(text)
         m = self.by_username.get(username)
         if kind == "question":
@@ -95,13 +100,6 @@ class Service:
                     f"Сменить статус на «{upd.new_status}»? ({hint})",
                     reply_markup=_kb([[("Да", f"st:yes:{pid}"), ("Нет", f"st:no:{pid}")]]),
                 )
-        # обновить досье после любой содержательной реплики
-        if kind in ("question", "progress"):
-            recent = await self.repo.recent_messages(username, limit=15)
-            old = await self.repo.get_profile(username)
-            summary = await self.llm.update_profile(old, recent)
-            await self.repo.set_profile(username, summary, ts_iso)
-
     async def on_unknown_chat(self, username: str, display: str):
         titles = self.settings.active_sheet_titles
         buttons = [[(t, f"add:{i}:{username}")] for i, t in enumerate(titles)]
