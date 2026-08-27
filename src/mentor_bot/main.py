@@ -1,10 +1,11 @@
 import asyncio
 import logging
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher
 
 from mentor_bot.config import load_settings
-from mentor_bot.jobs import drain_pending, ping_cycle, remind_cycle
+from mentor_bot.jobs import dossier_cycle, drain_pending, ping_cycle, remind_cycle
 from mentor_bot.kb import KBIndex, crawl, split_markdown
 from mentor_bot.llm import LLM
 from mentor_bot.routers import business, callbacks, commands
@@ -44,6 +45,14 @@ async def main():
         except Exception:
             log.exception("mentor alert failed on startup")
 
+    for title in settings.active_sheet_titles:
+        try:
+            if await sheets.ensure_dossier_column(title):
+                log.info("created «Досье» column in sheet %s", title)
+                await sender.notify_mentor(f"➕ В лист «{title}» добавлена колонка «Досье»")
+        except Exception:
+            log.exception("ensure_dossier_column failed for %s", title)
+
     async def reindex_fn():
         try:
             docs = await crawl(settings.edu_base_url, settings.edu_email, settings.edu_password)
@@ -76,6 +85,10 @@ async def main():
                       kwargs={"settings": settings}, max_instances=1)
     scheduler.add_job(drain_pending, "cron", minute="*",
                       args=[service, repo, sender, settings],
+                      max_instances=1, coalesce=True)
+    scheduler.add_job(dossier_cycle, "cron", hour=settings.dossier_hour, minute=13,
+                      args=[service, repo, llm, sender, settings],
+                      timezone=ZoneInfo(settings.tz_name),
                       max_instances=1, coalesce=True)
     scheduler.start()
 

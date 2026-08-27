@@ -158,6 +158,16 @@ class Repo:
             (username, summary, ts_iso),
         )
 
+    async def stale_profiles(self):
+        """Кому пора обновить досье: есть сообщения новее последнего обновления."""
+        rows = await self._all(
+            "SELECT m.username AS username FROM (SELECT DISTINCT username FROM messages) m "
+            "LEFT JOIN profiles p ON p.username = m.username "
+            "WHERE p.updated_ts IS NULL OR p.updated_ts < "
+            "(SELECT MAX(ts) FROM messages WHERE username = m.username)"
+        )
+        return [r["username"] for r in rows]
+
     # settings
     async def get_setting(self, key, default=None):
         row = await self._one("SELECT value FROM settings WHERE key=?", (key,))

@@ -29,6 +29,9 @@ class FakeSheets:
     async def append_mentee(self, title, display):
         pass
 
+    async def set_dossier(self, m, text):
+        pass
+
 
 class FakeLLM:
     def __init__(self, kind="other", status=None):
@@ -47,7 +50,7 @@ class FakeLLM:
     async def draft_answer(self, q, chunks, profile):
         return f"ЧЕРНОВИК[{q}]"
 
-    async def update_profile(self, old, recent):
+    async def update_profile(self, old, recent, notes=None):
         return "досье"
 
     async def embed(self, texts):

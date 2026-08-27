@@ -48,7 +48,7 @@ async def make(tmp_path, mentees=None):
     llm = FakeLLM()
     calls = []
 
-    async def gen_ping(display, status, recent, profile):
+    async def gen_ping(display, status, recent, profile, notes=None):
         calls.append(display)
         return f"ПИНГ[{display}]"
 
@@ -167,3 +167,79 @@ async def test_ping_cycle_backfills_sheet_date_from_chat(tmp_path):
     # таблица догнала телеграм, пинг не ушёл (связь 19.08 < 3 дней от 20.08)
     assert ("ivan", date(2026, 8, 19)) in sheets.dates
     assert sender.mentee_msgs == []
+
+
+async def test_dossier_cycle_updates_only_stale_and_writes_sheet(tmp_path):
+    from mentor_bot.jobs import dossier_cycle
+
+    mentees = [sm(username="ivan"), sm(username="petr")]
+    repo, sheets, sender, llm, svc = await make(tmp_path, mentees=mentees)
+    sheets.dossiers = []
+
+    async def set_dossier(m, text):
+        sheets.dossiers.append((m.username, text))
+
+    sheets.set_dossier = set_dossier
+    seen = []
+
+    async def update_profile(old, recent, notes=None):
+        seen.append((old, notes))
+        return "новое досье"
+
+    llm.update_profile = update_profile
+
+    await repo.log_message("ivan", "in", "привет", "2026-08-27T10:00:00+00:00")
+    await repo.set_profile("petr", "старое", "2026-08-27T11:00:00+00:00")
+    await repo.log_message("petr", "in", "привет", "2026-08-27T10:00:00+00:00")
+
+    await dossier_cycle(svc, repo, llm, sender, Cfg2(), now_utc=NOON_UTC)
+    assert sheets.dossiers == [("ivan", "новое досье")]     # petr не устарел
+    assert await repo.get_profile("ivan") == "новое досье"
+
+
+async def test_dossier_cycle_passes_mentor_notes(tmp_path):
+    from mentor_bot.jobs import dossier_cycle
+
+    mentee = sm(username="ivan")
+    mentee.notes = "тянет медленно, нужен пинок"
+    repo, sheets, sender, llm, svc = await make(tmp_path, mentees=[mentee])
+
+    async def set_dossier(m, text):
+        pass
+
+    sheets.set_dossier = set_dossier
+    seen = []
+
+    async def update_profile(old, recent, notes=None):
+        seen.append(notes)
+        return "досье"
+
+    llm.update_profile = update_profile
+    await repo.log_message("ivan", "in", "привет", "2026-08-27T10:00:00+00:00")
+    await dossier_cycle(svc, repo, llm, sender, Cfg2(), now_utc=NOON_UTC)
+    assert seen == ["тянет медленно, нужен пинок"]
+
+
+async def test_dossier_cycle_survives_sheet_error(tmp_path):
+    from mentor_bot.jobs import dossier_cycle
+
+    mentees = [sm(username="ivan"), sm(username="petr")]
+    repo, sheets, sender, llm, svc = await make(tmp_path, mentees=mentees)
+    written = []
+
+    async def set_dossier(m, text):
+        if m.username == "ivan":
+            raise RuntimeError("sheets down")
+        written.append(m.username)
+
+    sheets.set_dossier = set_dossier
+
+    async def update_profile(old, recent, notes=None):
+        return "досье"
+
+    llm.update_profile = update_profile
+    await repo.log_message("ivan", "in", "привет", "2026-08-27T10:00:00+00:00")
+    await repo.log_message("petr", "in", "привет", "2026-08-27T10:00:00+00:00")
+    await dossier_cycle(svc, repo, llm, sender, Cfg2(), now_utc=NOON_UTC)
+    assert written == ["petr"]                                  # цикл не остановился
+    assert any("Досье" in m[0] for m in sender.mentor_msgs)

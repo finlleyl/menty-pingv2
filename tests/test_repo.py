@@ -52,3 +52,17 @@ async def test_last_ping_ts_and_close_open_questions(tmp_path):
     assert (await repo.get_question(qid))["state"] == "answered"
     assert (await repo.get_question(other_qid))["state"] == "open"  # чужие вопросы не трогает
     await repo.close()
+
+
+async def test_stale_profiles(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    # у ivan досье нет вовсе → устарело
+    await repo.log_message("ivan", "in", "привет", "2026-08-27T10:00:00+00:00")
+    # у petr досье свежее последнего сообщения → не устарело
+    await repo.log_message("petr", "in", "привет", "2026-08-27T10:00:00+00:00")
+    await repo.set_profile("petr", "досье", "2026-08-27T11:00:00+00:00")
+    # у sveta досье старее последнего сообщения → устарело
+    await repo.set_profile("sveta", "досье", "2026-08-20T10:00:00+00:00")
+    await repo.log_message("sveta", "in", "новое", "2026-08-27T10:00:00+00:00")
+    assert sorted(await repo.stale_profiles()) == ["ivan", "sveta"]
+    await repo.close()

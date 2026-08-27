@@ -76,7 +76,7 @@ async def ping_cycle(service, repo, sender, llm, settings, now_utc: datetime | N
         try:
             recent = await repo.recent_messages(username, limit=10)
             profile = await repo.get_profile(username)
-            text = await llm.gen_ping(m.display, m.status, recent, profile)
+            text = await llm.gen_ping(m.display, m.status, recent, profile, m.notes)
         except Exception:
             log.exception("ping generation failed for %s", username)
             errors += 1
@@ -149,3 +149,31 @@ async def remind_cycle(repo, sender, now_utc: datetime | None = None, settings=N
             f"⏰ Висит вопрос от @{q['username']} ({q['created_ts'][:16]}):\n{q['question'][:200]}"
         )
         await repo.mark_reminded(q["id"])
+
+
+async def dossier_cycle(service, repo, llm, sender, settings, now_utc: datetime | None = None):
+    """Раз в сутки обновляет досье тех, у кого с прошлого раза была переписка."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+    try:
+        await service.sync_mentees()
+    except Exception:
+        log.exception("sheet sync failed")
+        await sender.notify_mentor("⚠️ Досье: не смог прочитать таблицу, цикл пропущен")
+        return
+
+    errors = 0
+    for username in await repo.stale_profiles():
+        m = service.by_username.get(username)
+        if m is None:
+            continue  # чат есть, а в таблице человека нет — не наш менти
+        try:
+            recent = await repo.recent_messages(username, limit=30)
+            old = await repo.get_profile(username)
+            summary = await llm.update_profile(old, recent, m.notes)
+            await repo.set_profile(username, summary, now_utc.isoformat())
+            await service.sheets.set_dossier(m, summary)
+        except Exception:
+            log.exception("dossier update failed for %s", username)
+            errors += 1
+    if errors:
+        await sender.notify_mentor(f"⚠️ Досье: {errors} ошибок, детали в логах")

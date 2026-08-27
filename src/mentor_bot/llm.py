@@ -74,7 +74,8 @@ DRAFT_SYS = (
 
 PROFILE_SYS = (
     "Обнови краткое досье ученика (3-6 предложений): чем занимается, что обсуждали, договорённости, тон "
-    "общения. Старое досье и свежая переписка ниже. Верни только текст досье."
+    "общения. Личные пометки ментора об ученике — самый достоверный источник: не противоречь им и не "
+    "смягчай их. Старое досье, пометки ментора и свежая переписка ниже. Верни только текст досье."
 )
 
 
@@ -141,8 +142,12 @@ class LLM:
         out: PlainText = await self._parse(self.smart, DRAFT_SYS, user, PlainText)
         return out.text
 
-    async def update_profile(self, old, recent) -> str:
-        user = f"Старое досье: {old or 'нет'}\n\nСвежая переписка:\n{_dialog(recent)}"
+    async def update_profile(self, old, recent, notes=None) -> str:
+        user = (
+            f"Старое досье: {old or 'нет'}\n\n"
+            f"Пометки ментора: {notes or 'нет'}\n\n"
+            f"Свежая переписка:\n{_dialog(recent)}"
+        )
         out: PlainText = await self._parse(self.fast, PROFILE_SYS, user, PlainText)
         return out.text
 
