@@ -5,6 +5,7 @@ import random
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+from mentor_bot.llm import LLMUnavailable
 from mentor_bot.pings import (
     effective_last_contact,
     in_send_window,
@@ -140,12 +141,31 @@ async def drain_pending(service, repo, sender, settings, now_utc: datetime | Non
         text = "\n".join(texts)
         try:
             await service.handle_buffered(username, text, row["last_in_ts"])
-        except Exception:
+        except LLMUnavailable as e:
+            # провайдер лежит, сообщение не виновато: буфер не трогаем, следующий тик повторит.
+            # Остальные буферы упрутся в то же самое — не долбим, ментору одно предупреждение
+            log.warning("LLM unavailable, keeping buffer for %s: %s", username, e)
+            if not await repo.get_setting("alerted_llm_down"):
+                await sender.notify_mentor(
+                    f"⚠️ LLM недоступен — разбор сообщений учеников на паузе, "
+                    f"повторяю каждую минуту, ничего не теряется.\n{str(e)[:300]}"
+                )
+                await repo.set_setting("alerted_llm_down", "1")
+            break
+        except Exception as e:
+            # битое сообщение: повтор не поможет, иначе оно дренажилось бы каждую минуту вечно
             log.exception("drain failed for %s", username)
-            await sender.notify_mentor(f"⚠️ Ошибка обработки сообщений @{username}: {text[:100]}")
-        finally:
+            await sender.notify_mentor(
+                f"⚠️ Не смог разобрать сообщения @{username} ({type(e).__name__}), "
+                f"убрал из очереди: {text[:100]}"
+            )
+            await repo.consume_pending(username, len(texts))
+        else:
             # снимаем ровно то, что обработали: дописанное за это время останется
             await repo.consume_pending(username, len(texts))
+            if await repo.get_setting("alerted_llm_down"):
+                await repo.set_setting("alerted_llm_down", "")
+                await sender.notify_mentor("✅ LLM снова отвечает, разбираю отложенные сообщения")
 
 async def remind_cycle(repo, sender, now_utc: datetime | None = None, settings=None):
     now_utc = now_utc or datetime.now(timezone.utc)

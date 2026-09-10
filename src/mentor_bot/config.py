@@ -6,16 +6,17 @@ class Settings(BaseSettings):
 
     bot_token: str
     mentor_user_id: int
-    openai_api_key: str
+    llm_api_key: str
+    llm_base_url: str = "https://openrouter.ai/api/v1"
     spreadsheet_id: str
     google_sa_path: str = "service_account.json"
     active_sheets: str
     edu_base_url: str = "https://edu.gomafia.co"
     edu_email: str = ""
     edu_password: str = ""
-    llm_model_smart: str = "gpt-5.1"
-    llm_model_fast: str = "gpt-5-mini"
-    embed_model: str = "text-embedding-3-small"
+    llm_model_smart: str = "openai/gpt-5.1"
+    llm_model_fast: str = "openai/gpt-5-mini"
+    embed_model: str = "openai/text-embedding-3-small"
     db_path: str = "data/bot.db"
     kb_path: str = "data/kb"
     tz_name: str = "Europe/Moscow"

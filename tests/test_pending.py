@@ -116,7 +116,7 @@ async def test_drain_clears_buffer_even_when_handling_raises(tmp_path):
     repo, sender, svc = await make_svc(tmp_path)
 
     async def boom(text):
-        raise RuntimeError("llm down")
+        raise RuntimeError("битый ответ")
 
     svc.llm.classify = boom
     await repo.buffer_incoming("ivan", "вопрос", "2026-08-27T10:00:00+00:00")
@@ -149,7 +149,7 @@ async def test_drain_keeps_late_message_even_when_handling_raises(tmp_path):
 
     async def boom(username, text, ts):
         await repo.buffer_incoming(username, "а ещё вопрос", "2026-08-27T10:09:00+00:00")
-        raise RuntimeError("llm down")
+        raise RuntimeError("битый ответ")
 
     svc.handle_buffered = boom
     await repo.buffer_incoming("ivan", "вопрос", "2026-08-27T10:00:00+00:00")
@@ -157,3 +157,49 @@ async def test_drain_keeps_late_message_even_when_handling_raises(tmp_path):
     row = await repo.get_pending("ivan")
     # сломанное сообщение выброшено, свежее осталось — цикла не будет
     assert json.loads(row["texts"]) == ["а ещё вопрос"]
+
+
+from mentor_bot.llm import LLMUnavailable
+
+
+async def test_drain_keeps_buffer_while_llm_is_down_and_alerts_once(tmp_path):
+    repo, sender, svc = await make_svc(tmp_path)
+    calls = []
+
+    async def down(username, text, ts):
+        calls.append(username)
+        raise LLMUnavailable("401 account_deactivated")
+
+    svc.handle_buffered = down
+    await repo.buffer_incoming("ivan", "Хорошо, спасибо!", "2026-08-27T10:00:00+00:00")
+    await repo.buffer_incoming("petr", "вопрос", "2026-08-27T10:01:00+00:00")
+    await drain_pending(svc, repo, sender, Cfg3(), now_utc=NOW)
+    await drain_pending(svc, repo, sender, Cfg3(), now_utc=NOW)
+    # сообщения учеников на месте — ждут, пока провайдер оживёт
+    assert json.loads((await repo.get_pending("ivan"))["texts"]) == ["Хорошо, спасибо!"]
+    assert await repo.get_pending("petr") is not None
+    # упёрлись в первый же буфер — остальные в тот же тик не дёргаем
+    assert calls == ["ivan", "ivan"]
+    # одно предупреждение на весь простой, а не по штуке в минуту на ученика
+    alerts = [m[0] for m in sender.mentor_msgs if "LLM недоступен" in m[0]]
+    assert len(alerts) == 1 and "account_deactivated" in alerts[0]
+
+
+async def test_drain_announces_recovery_and_rearms_alert(tmp_path):
+    repo, sender, svc = await make_svc(tmp_path)
+    original = svc.handle_buffered
+    state = {"down": True}
+
+    async def flaky(username, text, ts):
+        if state["down"]:
+            raise LLMUnavailable("502")
+        return await original(username, text, ts)
+
+    svc.handle_buffered = flaky
+    await repo.buffer_incoming("ivan", "вопрос", "2026-08-27T10:00:00+00:00")
+    await drain_pending(svc, repo, sender, Cfg3(), now_utc=NOW)
+    state["down"] = False
+    await drain_pending(svc, repo, sender, Cfg3(), now_utc=NOW)
+    assert await repo.get_pending("ivan") is None             # отложенное разобрано
+    assert any("снова отвечает" in m[0] for m in sender.mentor_msgs)
+    assert not await repo.get_setting("alerted_llm_down")     # следующий простой снова предупредит

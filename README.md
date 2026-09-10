@@ -13,7 +13,7 @@ Telegram Business бот-ассистент ментора: авто-пинги 
    Credentials → Service Account → ключ JSON → сохранить как `service_account.json`
    рядом с docker-compose. Таблицу расшарить (Viewer недостаточно — Editor) на
    email сервисного аккаунта (`...@...iam.gserviceaccount.com`).
-5. **OpenAI**: ключ в `.env` (`OPENAI_API_KEY`).
+5. **LLM**: ключ OpenRouter в `.env` (`LLM_API_KEY`). Модели — в нотации OpenRouter (`openai/gpt-5.1`); другой OpenAI-совместимый провайдер подключается через `LLM_BASE_URL`.
 6. **Edu-платформа**: логин/пароль в `.env` (`EDU_EMAIL`, `EDU_PASSWORD`) — нужны краулеру
    для авторизации на edu-платформе при `/reindex`; без них база знаний не соберётся.
 7. `cp .env.example .env` и заполнить. `ACTIVE_SHEETS` — точные названия листов через запятую.

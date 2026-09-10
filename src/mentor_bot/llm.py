@@ -1,6 +1,7 @@
 import re
 from typing import Literal
 
+import openai
 from pydantic import BaseModel
 
 from mentor_bot.stages import STAGE_LABELS, parse_stage, ping_topics
@@ -85,26 +86,54 @@ PROFILE_SYS = (
 )
 
 
+class LLMUnavailable(Exception):
+    """Провайдер не отвечает: сеть, ключ, кредиты, лимиты, 5xx. Сообщение не виновато — повторить позже."""
+
+
+# 402 — у OpenRouter кончились кредиты; 404 — нет модели/хоста под параметры, лечится конфигом.
+# 400 и 403 (у OpenRouter это модерация входа) — проблема конкретного запроса, повтор не поможет.
+_OUTAGE_STATUSES = {401, 402, 404, 408, 409, 429}
+
+
+def _is_outage(e: Exception) -> bool:
+    if isinstance(e, openai.APIConnectionError):
+        return True
+    if isinstance(e, openai.APIStatusError):
+        return e.status_code in _OUTAGE_STATUSES or e.status_code >= 500
+    return False
+
+
 def _dialog(recent: list[dict]) -> str:
     return "\n".join(f"{'Ученик' if m['direction'] == 'in' else 'Ментор'}: {m['text']}" for m in recent)
 
 
 class LLM:
-    def __init__(self, api_key, model_smart, model_fast, embed_model, client=None):
+    def __init__(self, api_key, model_smart, model_fast, embed_model, client=None, base_url=None):
         if client is None:
-            from openai import AsyncOpenAI
-            client = AsyncOpenAI(api_key=api_key)
+            client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url or None)
         self._c = client
         self.smart = model_smart
         self.fast = model_fast
         self.embed_model = embed_model
+        # OpenRouter раздаёт модель нескольким хостам, structured outputs умеют не все —
+        # без этого запрос со схемой может уехать туда, где схему проигнорируют
+        self._route = (
+            {"provider": {"require_parameters": True}}
+            if base_url and "openrouter.ai" in base_url else None
+        )
 
     async def _parse(self, model, system, user, schema):
-        resp = await self._c.chat.completions.parse(
-            model=model,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            response_format=schema,
-        )
+        try:
+            resp = await self._c.chat.completions.parse(
+                model=model,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                response_format=schema,
+                extra_body=self._route,
+            )
+        except Exception as e:
+            if _is_outage(e):
+                raise LLMUnavailable(str(e)) from e
+            raise
         return resp.choices[0].message.parsed
 
     async def classify(self, text: str) -> str:
@@ -158,5 +187,10 @@ class LLM:
         return out.text
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
-        resp = await self._c.embeddings.create(model=self.embed_model, input=texts)
+        try:
+            resp = await self._c.embeddings.create(model=self.embed_model, input=texts)
+        except Exception as e:
+            if _is_outage(e):
+                raise LLMUnavailable(str(e)) from e
+            raise
         return [d.embedding for d in resp.data]

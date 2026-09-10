@@ -108,3 +108,64 @@ def test_looks_like_verdict_catches_pipeline_phrases():
 def test_looks_like_verdict_still_ignores_chatter():
     assert not looks_like_verdict("напиши мне завтра")
     assert not looks_like_verdict("какой у тебя стек на проекте?")
+
+
+import httpx
+import openai
+import pytest
+
+from mentor_bot.llm import LLMUnavailable
+
+
+def _status_error(cls, code):
+    req = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+    return cls("boom", response=httpx.Response(code, request=req), body=None)
+
+
+class RaisingCompletions:
+    def __init__(self, exc):
+        self.exc = exc
+
+    async def parse(self, **kwargs):
+        raise self.exc
+
+
+def _raising_llm(exc):
+    fake = FakeClient([])
+    fake.chat.completions = RaisingCompletions(exc)
+    return LLM("k", "smart", "fast", "emb", client=fake)
+
+
+async def test_openrouter_requires_hosts_that_support_the_schema():
+    fake = FakeClient([Classification(kind="other")])
+    llm = LLM("k", "smart", "fast", "emb", client=fake, base_url="https://openrouter.ai/api/v1")
+    await llm.classify("спасибо")
+    assert fake.chat.completions.calls[0]["extra_body"] == {"provider": {"require_parameters": True}}
+
+
+async def test_direct_provider_gets_no_openrouter_routing():
+    fake = FakeClient([Classification(kind="other")])
+    llm = LLM("k", "smart", "fast", "emb", client=fake)
+    await llm.classify("спасибо")
+    assert fake.chat.completions.calls[0]["extra_body"] is None
+
+
+@pytest.mark.parametrize("exc", [
+    _status_error(openai.AuthenticationError, 401),          # ключ отозван / аккаунт отключён
+    _status_error(openai.APIStatusError, 402),               # кончились кредиты OpenRouter
+    _status_error(openai.RateLimitError, 429),
+    _status_error(openai.InternalServerError, 502),
+    openai.APIConnectionError(request=httpx.Request("POST", "https://openrouter.ai")),
+])
+async def test_provider_outage_becomes_llm_unavailable(exc):
+    with pytest.raises(LLMUnavailable):
+        await _raising_llm(exc).classify("спасибо")
+
+
+@pytest.mark.parametrize("exc", [
+    _status_error(openai.BadRequestError, 400),
+    _status_error(openai.PermissionDeniedError, 403),        # модерация OpenRouter — вина запроса
+])
+async def test_request_specific_errors_propagate_as_is(exc):
+    with pytest.raises(type(exc)):
+        await _raising_llm(exc).classify("спасибо")

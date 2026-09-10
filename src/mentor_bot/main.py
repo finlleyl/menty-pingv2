@@ -25,7 +25,10 @@ async def main():
     )
     repo = await Repo.open(settings.db_path)
     sheets = SheetsClient(settings.google_sa_path, settings.spreadsheet_id, settings.active_sheet_titles)
-    llm = LLM(settings.openai_api_key, settings.llm_model_smart, settings.llm_model_fast, settings.embed_model)
+    llm = LLM(
+        settings.llm_api_key, settings.llm_model_smart, settings.llm_model_fast, settings.embed_model,
+        base_url=settings.llm_base_url,
+    )
     kb = KBIndex(settings.kb_path)
     if not kb.load():
         log.warning("KB index empty — run /reindex")
