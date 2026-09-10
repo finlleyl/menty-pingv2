@@ -35,3 +35,6 @@ def test_llm_defaults_point_to_openrouter(monkeypatch):
     assert s.llm_base_url == "https://openrouter.ai/api/v1"
     # те же модели OpenAI, в нотации OpenRouter: индекс KB остаётся совместимым
     assert s.embed_model == "openai/text-embedding-3-small"
+    # smart — пинги и черновики, fast — классификация на каждое сообщение
+    assert s.llm_model_smart == "openai/gpt-5.6-sol"
+    assert s.llm_model_fast == "openai/gpt-5.6-luna"
