@@ -35,7 +35,9 @@ class Service:
         mentees = await self.sheets.load_mentees()
         self.by_username = {m.username: m for m in mentees}
         now_iso = datetime.now(timezone.utc).isoformat()
-        for m in mentees:
+        # по by_username, а не по строкам: ник, записанный дважды, иначе «прыгал» бы
+        # между двумя статусами на каждой синхронизации и засорял историю
+        for m in self.by_username.values():
             await self.repo.upsert_mentee(m.username, sheet_title=m.sheet_title, row=m.row)
             # ручные правки статуса в таблице тоже попадают в историю и сдвигают status_since
             await self.repo.record_status(m.username, m.status, now_iso, "sheet")
@@ -79,7 +81,7 @@ class Service:
         await self.repo.log_message(username, "out", text, ts_iso)
         await self.repo.reset_unanswered(username)
         # ответ ментора своими словами — лучший пример для будущих черновиков
-        await self.repo.record_manual_answer(username, text)
+        await self.repo.record_manual_answer(username, text, datetime.fromisoformat(ts_iso))
         await self.repo.close_open_questions(username)
         # ментор ответил сам — накопленное обрабатывать не нужно, ждущий пинг тоже
         await self.repo.drop_pending(username)
@@ -121,12 +123,6 @@ class Service:
     async def handle_buffered(self, username: str, text: str, ts_iso: str):
         """Разбор накопленного за окно дебаунса. Вызывается джобом drain_pending."""
         m = self.by_username.get(username)
-        # фидбэк с собеса разбираем первым: если дальше упадёт LLM, буфер повторится,
-        # а has_interview_notes не даст записать те же вопросы дважды
-        if (m is not None and parse_stage(m.status) in ("interviews", "market")
-                and looks_like_interview(text)
-                and not await self.repo.has_interview_notes(username, ts_iso)):
-            await self._collect_interview(username, text, ts_iso)
         kind = await self.llm.classify(text)
         if kind == "question":
             emb = (await self.llm.embed([text]))[0]
@@ -149,9 +145,17 @@ class Service:
                 hint = "уверенно" if upd.confidence == "high" else "под вопросом"
                 await self._propose(username, m, upd.new_status, text, f"@{username} написал",
                                     f" ({hint})")
+        # фидбэк с собеса — последним и без права уронить разбор: основное уже сделано,
+        # и повтор буфера из-за этого шага продублировал бы черновики и предложения
+        if (m is not None and parse_stage(m.status) in ("interviews", "market")
+                and looks_like_interview(text)):
+            try:
+                await self._collect_interview(username, text, ts_iso)
+            except Exception:
+                log.exception("interview extraction failed for %s", username)
     async def _collect_interview(self, username: str, text: str, ts_iso: str):
         report = await self.llm.extract_interview(text)
-        if not report.items:
+        if report is None or not report.items:
             return
         embs = await self.llm.embed([it.question for it in report.items])
         await self.repo.add_interview_notes(username, ts_iso, report.items, embs)

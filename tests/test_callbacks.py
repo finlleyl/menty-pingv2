@@ -183,3 +183,24 @@ async def test_send_as_is_records_final(tmp_path):
     await handle_q_callback(f"q:send:{qid}", repo, sender, svc)
     assert (await repo.get_question(qid))["final"] == "черновик"
     assert await repo.edit_examples() == []        # не правка — в примеры стиля не идёт
+
+
+async def test_forgotten_edit_expires(tmp_path):
+    from mentor_bot.routers.callbacks import EDIT_KEY, handle_edit_text
+    repo, sheets, sender, svc = await make(tmp_path)
+    qid = await repo.add_question("ivan", "вопрос", "черновик", "2026-08-19T10:00:00+00:00")
+    await repo.set_setting(EDIT_KEY, f"q:{qid}:2026-08-19T10:00:00+00:00")   # давно
+    out = await handle_edit_text("случайный текст", repo, sender, svc)
+    assert "отменена" in out and sender.mentee_msgs == []
+    assert (await repo.get_question(qid))["state"] == "open"
+
+
+async def test_ping_draft_not_sent_after_pause(tmp_path):
+    from mentor_bot.routers.callbacks import handle_p_callback
+    from tests.test_commands import Cfg
+    repo, sheets, sender, svc = await make(tmp_path)
+    svc.settings = type("S", (Cfg,), {"max_unanswered_pings": 3})()
+    pid = await repo.add_ping_draft("ivan", "куда пропал?", "2026-08-20T12:00:00+00:00")
+    await repo.set_pause("ivan", "2099-01-01T00:00:00+00:00")
+    out = await handle_p_callback(f"p:send:{pid}", repo, sender, svc)
+    assert "нельзя" in out and sender.mentee_msgs == []

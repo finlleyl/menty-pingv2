@@ -29,6 +29,10 @@ PIPELINE = ["sprint1", "sprint2", "sprint3", "sprint4", "resume", "legend", "moc
 UNTIMED = {"offer", "paused", "unknown"}
 
 
+def _pos(stage: str) -> int:
+    return PIPELINE.index(stage) if stage in PIPELINE else -1
+
+
 @dataclass
 class Sample:
     days: float
@@ -58,7 +62,11 @@ def stage_samples(history: list[dict], now_utc: datetime) -> dict[str, list[Samp
             if not known or stage in UNTIMED:
                 continue
             if i + 1 < len(segments):
-                end, observed = segments[i + 1][1], True
+                nxt = segments[i + 1][0]
+                # «прошёл стадию» — только шаг вперёд по конвейеру. Уход в паузу, в пустой
+                # статус или откат назад — не завершение: наблюдение цензурируем
+                forward = (nxt not in UNTIMED or nxt == "offer") and _pos(nxt) > _pos(stage)
+                end, observed = segments[i + 1][1], forward
             else:
                 end, observed = now_utc, False
             days = (end - start).total_seconds() / 86400

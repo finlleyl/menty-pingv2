@@ -45,3 +45,15 @@ def test_cluster_groups_paraphrases():
     embs = [[1.0, 0.0], [0.98, 0.2], [0.0, 1.0], [0.1, 0.99]]
     assert cluster(embs, 0.9) == [[0, 1], [2, 3]]
     assert cluster(embs, 0.999) == [[0], [1], [2], [3]]
+
+
+def test_pause_or_rollback_is_censored_not_completed():
+    history = [
+        h("a", None, "Спринт 2", "2026-08-01T00:00:00+00:00", "bot"),
+        h("a", "Спринт 2", "приостановил", "2026-08-05T00:00:00+00:00"),
+        h("b", None, "Спринт 3", "2026-08-01T00:00:00+00:00", "bot"),
+        h("b", "Спринт 3", "Спринт 2", "2026-08-02T00:00:00+00:00"),       # откат-исправление
+    ]
+    got = stage_samples(history, NOW)
+    assert [(s.days, s.observed) for s in got["sprint2"]] == [(4.0, False), (30.0, False)]
+    assert [(s.days, s.observed) for s in got["sprint3"]] == [(1.0, False)]

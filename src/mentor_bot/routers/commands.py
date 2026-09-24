@@ -194,6 +194,9 @@ def make_router(service, repo, sender, settings, reindex_fn, backup_fn=None) -> 
     @router.message(F.text & ~F.text.startswith("/"))
     async def on_text(message: Message):
         # обычный текст в личке бота — это правка черновика после кнопки «✏️ Править»
+        if message.forward_origin is not None:
+            await message.answer("Пересланное как правку не отправляю — напиши текст сам")
+            return
         reply = await handle_edit_text(message.text, repo, sender, service)
         await message.answer(reply or "Правку ничего не ждёт. /help — список команд")
 

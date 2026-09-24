@@ -1,9 +1,13 @@
 import json
 import os
+from datetime import timedelta
 
 import aiosqlite
 
 from .db import SCHEMA
+
+MIN_ANSWER_CHARS = 40       # короче — «ок, щас гляну», а не ответ
+ANSWER_WINDOW_HOURS = 6     # сколько после вопроса ждём настоящего ответа ментора
 
 
 class Repo:
@@ -72,19 +76,23 @@ class Repo:
         Первое наблюдение из таблицы — не переход: когда ученик туда попал, неизвестно,
         поэтому status_since не трогаем, а событие помечаем 'initial'.
         True — был настоящий переход."""
+        from mentor_bot.stages import parse_stage
         status = (status or "").strip()
         await self._exec("INSERT OR IGNORE INTO mentees(username) VALUES (?)", (username,))
         rec = await self.get_mentee(username)
         prev = rec["last_status"]
         if prev == status:
             return False
+        if not status and prev:
+            return False  # ячейку на минуту очистили — это не смена стадии
         initial = prev is None and source == "sheet"
         await self._exec(
             "INSERT INTO status_history(username, from_status, to_status, ts, source) "
             "VALUES (?,?,?,?,?)",
             (username, prev, status, ts_iso, "initial" if initial else source),
         )
-        if initial:
+        if initial or parse_stage(prev) == parse_stage(status):
+            # первое наблюдение или переименование («3 спринт» → «Спринт 3»): таймер стадии не сбрасываем
             await self._exec("UPDATE mentees SET last_status=? WHERE username=?", (status, username))
             return False
         await self._exec(
@@ -178,11 +186,18 @@ class Repo:
         """Что в итоге ушло ученику: черновик как есть или правка ментора."""
         await self._exec("UPDATE questions SET final=? WHERE id=?", (final, qid))
 
-    async def record_manual_answer(self, username, text):
-        """Ментор ответил в чате сам — это и есть ответ на открытые вопросы."""
+    async def record_manual_answer(self, username, text, now_utc):
+        """Ментор ответил в чате сам — это и есть ответ на вопрос.
+
+        Короткое «щас гляну» ответом не считаем: вопрос оно закроет (close_open_questions),
+        а настоящий ответ, пришедший следом в пределах окна, запишется уже в закрытый вопрос."""
+        if len(text.strip()) < MIN_ANSWER_CHARS:
+            return
+        since = (now_utc - timedelta(hours=ANSWER_WINDOW_HOURS)).isoformat()
         await self._exec(
-            "UPDATE questions SET final=? WHERE username=? AND state='open' AND final IS NULL",
-            (text, username),
+            "UPDATE questions SET final=? WHERE username=? AND final IS NULL "
+            "AND state IN ('open', 'answered') AND created_ts >= ?",
+            (text, username, since),
         )
 
     async def edit_examples(self, limit=5):
@@ -338,6 +353,7 @@ class Repo:
         """Консистентная копия базы через то же соединение (без гонки с записями)."""
         if os.path.exists(path):
             os.remove(path)
+        await self._c.commit()   # VACUUM INTO не работает внутри открытой транзакции
         await self._c.execute("VACUUM INTO ?", (path,))
 
     # ping_drafts — пинги, ждущие решения ментора (режим review или провал проверки)
@@ -358,6 +374,16 @@ class Repo:
             (username,),
         )
 
+    async def claim(self, table, rid, state="sending") -> bool:
+        """Атомарно забрать запись open → state. Два быстрых нажатия «Отправить» обрабатываются
+        конкурентно; отправит только тот, чей UPDATE реально сменил состояние."""
+        assert table in ("ping_drafts", "questions")
+        cur = await self._c.execute(
+            f"UPDATE {table} SET state=? WHERE id=? AND state='open'", (state, rid)
+        )
+        await self._c.commit()
+        return cur.rowcount == 1
+
     async def set_ping_draft_state(self, pid, state):
         await self._exec("UPDATE ping_drafts SET state=? WHERE id=?", (state, pid))
 
@@ -367,13 +393,6 @@ class Repo:
         )
 
     # interview_notes — вопросы с собесов, которые пересказал ученик
-    async def has_interview_notes(self, username, source_ts):
-        row = await self._one(
-            "SELECT 1 AS x FROM interview_notes WHERE username=? AND source_ts=? LIMIT 1",
-            (username, source_ts),
-        )
-        return row is not None
-
     async def add_interview_notes(self, username, source_ts, items, embs):
         for it, emb in zip(items, embs):
             await self._c.execute(

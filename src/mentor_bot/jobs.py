@@ -15,6 +15,7 @@ from mentor_bot.llm import LLMUnavailable
 from mentor_bot.pings import (
     effective_last_contact,
     in_send_window,
+    is_stopped,
     parse_iso_utc,
     should_ping,
 )
@@ -191,14 +192,25 @@ async def send_ping_draft(pid, service, repo, sender, settings, text=None,
     if m is None:
         await repo.set_ping_draft_state(pid, "stale")
         return DraftOutcome(f"@{username} больше нет в таблице")
+    # пока черновик лежал, могли поставить паузу или стоп-статус — перепроверяем
+    rec = await repo.get_mentee(username) or {}
+    paused = rec.get("paused_until") and parse_iso_utc(rec["paused_until"]) > now_utc
+    if paused or is_stopped(m.status, settings.stop_status_list) \
+            or rec.get("unanswered_pings", 0) >= settings.max_unanswered_pings:
+        await repo.set_ping_draft_state(pid, "stale")
+        return DraftOutcome(f"@{username} сейчас пинговать нельзя (пауза, стоп-статус или игнор) — не отправляю")
+    if not await repo.claim("ping_drafts", pid):
+        return DraftOutcome("Уже обработано")   # второе быстрое нажатие
     text = text or d["text"]
     await repo.log_ping(username, now_utc.isoformat(), "attempt")
     try:
         result = await sender.send_to_mentee(username, text)
     except Exception:
         log.exception("ping draft send failed for %s", username)
+        await repo.set_ping_draft_state(pid, "open")
         return DraftOutcome("Ошибка отправки", retry=True)
     if result not in ("sent", "dry"):
+        await repo.set_ping_draft_state(pid, "open")
         return DraftOutcome(f"Не отправлено: {result}", retry=True)
     await repo.set_ping_draft_state(pid, result)
     await after_ping(result, username, m, text, service, repo, sender, settings, now_utc)
