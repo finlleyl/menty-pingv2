@@ -24,6 +24,17 @@ class PlainText(BaseModel):
     text: str
 
 
+class InterviewItem(BaseModel):
+    company: str | None
+    stage: str | None          # «HR», «техничка», «лайвкодинг», «финал» — как назвал ученик
+    question: str              # сам вопрос или задача, коротко
+    failed: bool               # ученик сказал, что не ответил, поплыл, срезался
+
+
+class InterviewReport(BaseModel):
+    items: list[InterviewItem]
+
+
 CLASSIFY_SYS = (
     "Ты сортируешь сообщения учеников ментора по Go-разработке. "
     "question — ученик задаёт вопрос, требующий ответа ментора (технический или организационный). "
@@ -93,6 +104,26 @@ PROFILE_SYS = (
     "общения. Личные пометки ментора об ученике — самый достоверный источник: не противоречь им и не "
     "смягчай их. Старое досье, пометки ментора и свежая переписка ниже. Верни только текст досье."
 )
+
+
+INTERVIEW_SYS = (
+    "Ученик курса Go-разработки пишет ментору. Если он рассказывает о прошедшем собеседовании, "
+    "выпиши КАЖДЫЙ конкретный вопрос или задачу, которые ему задавали, отдельным пунктом, "
+    "коротко и по сути (например: «чем отличается буферизованный канал от небуферизованного»). "
+    "failed=true, если ученик говорит, что не ответил, запутался, завалил или срезался на этом. "
+    "company и stage — если названы, иначе null. Общие слова («было норм», «спрашивали про Go») "
+    "пунктами не считаются. Если рассказа о собеседовании нет — items=[]."
+)
+
+# Предфильтр: разбирать фидбэк моделью стоит, только если в тексте хоть что-то про собес
+_INTERVIEW_RE = re.compile(
+    r"собес|интервью|скрин|техничк|лайвкод|фидб[эе]к|спрашивал|спросил|задач[аиуе]|тимлид|\bhr\b",
+    re.IGNORECASE,
+)
+
+
+def looks_like_interview(text: str) -> bool:
+    return bool(_INTERVIEW_RE.search(text or ""))
 
 
 class LLMUnavailable(Exception):
@@ -235,6 +266,9 @@ class LLM:
         )
         out: PlainText = await self._parse(self.fast, PROFILE_SYS, user, PlainText, "dossier")
         return out.text
+
+    async def extract_interview(self, text: str) -> InterviewReport:
+        return await self._parse(self.fast, INTERVIEW_SYS, text, InterviewReport, "interview")
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         try:

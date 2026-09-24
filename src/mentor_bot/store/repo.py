@@ -365,3 +365,34 @@ class Repo:
         await self._exec(
             "UPDATE ping_drafts SET state=? WHERE username=? AND state='open'", (state, username)
         )
+
+    # interview_notes — вопросы с собесов, которые пересказал ученик
+    async def has_interview_notes(self, username, source_ts):
+        row = await self._one(
+            "SELECT 1 AS x FROM interview_notes WHERE username=? AND source_ts=? LIMIT 1",
+            (username, source_ts),
+        )
+        return row is not None
+
+    async def add_interview_notes(self, username, source_ts, items, embs):
+        for it, emb in zip(items, embs):
+            await self._c.execute(
+                "INSERT INTO interview_notes(username, source_ts, company, stage, question, failed, emb) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (username, source_ts, it.company, it.stage, it.question, int(it.failed),
+                 json.dumps(emb)),
+            )
+        await self._c.commit()
+
+    async def interview_questions(self, failed_only=True, since_iso=None):
+        sql = "SELECT * FROM interview_notes WHERE emb IS NOT NULL"
+        args: list = []
+        if failed_only:
+            sql += " AND failed=1"
+        if since_iso:
+            sql += " AND source_ts >= ?"
+            args.append(since_iso)
+        rows = await self._all(sql + " ORDER BY id", tuple(args))
+        for r in rows:
+            r["emb"] = json.loads(r["emb"])
+        return rows

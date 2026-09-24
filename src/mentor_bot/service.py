@@ -5,7 +5,8 @@ from zoneinfo import ZoneInfo
 import numpy as np
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from mentor_bot.llm import looks_like_verdict
+from mentor_bot.llm import looks_like_interview, looks_like_verdict
+from mentor_bot.stages import parse_stage
 
 log = logging.getLogger(__name__)
 
@@ -119,8 +120,14 @@ class Service:
 
     async def handle_buffered(self, username: str, text: str, ts_iso: str):
         """Разбор накопленного за окно дебаунса. Вызывается джобом drain_pending."""
-        kind = await self.llm.classify(text)
         m = self.by_username.get(username)
+        # фидбэк с собеса разбираем первым: если дальше упадёт LLM, буфер повторится,
+        # а has_interview_notes не даст записать те же вопросы дважды
+        if (m is not None and parse_stage(m.status) in ("interviews", "market")
+                and looks_like_interview(text)
+                and not await self.repo.has_interview_notes(username, ts_iso)):
+            await self._collect_interview(username, text, ts_iso)
+        kind = await self.llm.classify(text)
         if kind == "question":
             emb = (await self.llm.embed([text]))[0]
             chunks = self.kb.search(text, emb, k=5)
@@ -142,6 +149,18 @@ class Service:
                 hint = "уверенно" if upd.confidence == "high" else "под вопросом"
                 await self._propose(username, m, upd.new_status, text, f"@{username} написал",
                                     f" ({hint})")
+    async def _collect_interview(self, username: str, text: str, ts_iso: str):
+        report = await self.llm.extract_interview(text)
+        if not report.items:
+            return
+        embs = await self.llm.embed([it.question for it in report.items])
+        await self.repo.add_interview_notes(username, ts_iso, report.items, embs)
+        failed = [it.question for it in report.items if it.failed]
+        lines = [f"🎯 @{username} про собес: записал вопросов — {len(report.items)}"]
+        if failed:
+            lines.append("Срезался на: " + "; ".join(q[:80] for q in failed[:5]))
+        await self.sender.notify_mentor("\n".join(lines))
+
     async def _similar_answers(self, emb, k: int = 3):
         """Прошлые вопросы, близкие по смыслу, вместе с тем, что ментор на них ответил."""
         rows = await self.repo.answered_questions()

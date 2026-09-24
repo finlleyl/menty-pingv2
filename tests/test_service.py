@@ -289,3 +289,45 @@ async def test_dissimilar_answers_are_not_used(tmp_path):
     await svc.handle_buffered("ivan", "про каналы", "2026-08-20T10:00:00+00:00")   # эмбеддинг [1, 0]
     assert llm.draft_ctx["similar"] == []
     await repo.close()
+
+
+class InterviewLLM(FakeLLM):
+    def __init__(self):
+        super().__init__(kind="other")
+        self.extract_calls = 0
+
+    async def extract_interview(self, text):
+        from mentor_bot.llm import InterviewItem, InterviewReport
+        self.extract_calls += 1
+        return InterviewReport(items=[
+            InterviewItem(company="Ozon", stage="техничка", question="как устроен map", failed=True),
+            InterviewItem(company="Ozon", stage="техничка", question="что такое горутина", failed=False),
+        ])
+
+    async def embed(self, texts):
+        return [[1.0, 0.0] for _ in texts]
+
+
+async def test_interview_feedback_is_collected_once(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    llm, sender = InterviewLLM(), FakeSender()
+    svc = Service(repo, FakeSheets([sm(status="Собесы")]), llm, sender, FakeKB(), FakeSettings())
+    await svc.sync_mentees()
+    msg = "был на техничке в Ozon, спросили про map — поплыл"
+    await svc.handle_buffered("ivan", msg, "2026-08-19T10:00:00+00:00")
+    await svc.handle_buffered("ivan", msg, "2026-08-19T10:00:00+00:00")   # повтор после сбоя LLM
+    assert llm.extract_calls == 1
+    rows = await repo.interview_questions()
+    assert [r["question"] for r in rows] == ["как устроен map"]
+    assert "Срезался на: как устроен map" in sender.mentor_msgs[0][0]
+    await repo.close()
+
+
+async def test_interview_extraction_skipped_on_sprint_stage(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    llm = InterviewLLM()
+    svc = Service(repo, FakeSheets([sm(status="Спринт 2")]), llm, FakeSender(), FakeKB(), FakeSettings())
+    await svc.sync_mentees()
+    await svc.handle_buffered("ivan", "в задаче спринта спросил бы про map", "2026-08-19T10:00:00+00:00")
+    assert llm.extract_calls == 0
+    await repo.close()
