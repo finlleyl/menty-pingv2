@@ -5,7 +5,9 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher
 
 from mentor_bot.config import load_settings
-from mentor_bot.jobs import backup_db, dossier_cycle, drain_pending, ping_cycle, remind_cycle
+from mentor_bot.jobs import (
+    backup_db, digest_cycle, dossier_cycle, drain_pending, ping_cycle, remind_cycle,
+)
 from mentor_bot.kb import KBIndex, crawl, split_markdown
 from mentor_bot.llm import LLM
 from mentor_bot.routers import business, callbacks, commands
@@ -106,6 +108,10 @@ async def main():
                       args=[service, repo, llm, sender, settings],
                       timezone=ZoneInfo(settings.tz_name),
                       max_instances=1, coalesce=True)
+    scheduler.add_job(digest_cycle, "cron", day_of_week=settings.digest_weekday,
+                      hour=settings.digest_hour, minute=3,
+                      args=[service, repo, sender, settings],
+                      timezone=ZoneInfo(settings.tz_name), max_instances=1, coalesce=True)
     if settings.backup_hour >= 0:
         scheduler.add_job(nightly_backup, "cron", hour=settings.backup_hour, minute=41,
                           timezone=ZoneInfo(settings.tz_name), max_instances=1, coalesce=True)

@@ -147,6 +147,16 @@ def make_router(service, repo, sender, settings, reindex_fn, backup_fn=None) -> 
     async def cmd_dryrun(message: Message):
         await message.answer(await handle_dryrun(args_of(message), repo))
 
+    @router.message(Command("digest"))
+    async def cmd_digest(message: Message):
+        from mentor_bot.jobs import digest_cycle
+        await digest_cycle(service, repo, sender, settings)
+
+    @router.message(Command("fails"))
+    async def cmd_fails(message: Message):
+        from mentor_bot.digest import fails_text
+        await message.answer(await fails_text(repo))
+
     @router.message(Command("pingmode"))
     async def cmd_pingmode(message: Message):
         await message.answer(await handle_pingmode(args_of(message), repo))

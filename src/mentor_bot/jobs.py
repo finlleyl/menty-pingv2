@@ -302,3 +302,14 @@ async def backup_db(repo, sender, now_utc: datetime | None = None):
     name = f"mentor-bot-{now_utc:%Y%m%d-%H%M}.db.gz"
     await sender.send_file_to_mentor(data, name, caption="💾 Бэкап базы бота")
     return name
+
+
+async def digest_cycle(service, repo, sender, settings, now_utc: datetime | None = None):
+    from mentor_bot.digest import digest_text
+    now_utc = now_utc or datetime.now(timezone.utc)
+    try:
+        await service.sync_mentees()
+    except Exception:
+        log.exception("sheet sync failed")
+        await sender.notify_mentor("⚠️ Сводка: не смог прочитать таблицу, считаю по кэшу")
+    await sender.notify_mentor(await digest_text(service, repo, settings, now_utc))
