@@ -23,10 +23,13 @@ class Repo:
     @staticmethod
     async def _migrate(conn):
         """Догоняем схему на базах, созданных прошлыми версиями."""
-        cur = await conn.execute("PRAGMA table_info(mentees)")
-        cols = {row[1] for row in await cur.fetchall()}
-        if "status_since" not in cols:
-            await conn.execute("ALTER TABLE mentees ADD COLUMN status_since TEXT")
+        for table, col in (
+            ("mentees", "status_since"), ("mentees", "last_status"),
+            ("proposals", "from_status"), ("questions", "final"), ("questions", "emb"),
+        ):
+            cur = await conn.execute(f"PRAGMA table_info({table})")
+            if col not in {row[1] for row in await cur.fetchall()}:
+                await conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
 
     async def close(self):
         await self._c.close()
@@ -61,6 +64,41 @@ class Repo:
         """Момент, когда ментор подтвердил текущий статус. От него считается ожидание."""
         await self._exec("INSERT OR IGNORE INTO mentees(username) VALUES (?)", (username,))
         await self._exec("UPDATE mentees SET status_since=? WHERE username=?", (ts_iso, username))
+
+    async def record_status(self, username, status, ts_iso, source) -> bool:
+        """Фиксирует статус, увиденный в таблице (source='sheet') или подтверждённый кнопкой
+        (source='bot'). Смена пишется в status_history и сдвигает status_since.
+
+        Первое наблюдение из таблицы — не переход: когда ученик туда попал, неизвестно,
+        поэтому status_since не трогаем, а событие помечаем 'initial'.
+        True — был настоящий переход."""
+        status = (status or "").strip()
+        await self._exec("INSERT OR IGNORE INTO mentees(username) VALUES (?)", (username,))
+        rec = await self.get_mentee(username)
+        prev = rec["last_status"]
+        if prev == status:
+            return False
+        initial = prev is None and source == "sheet"
+        await self._exec(
+            "INSERT INTO status_history(username, from_status, to_status, ts, source) "
+            "VALUES (?,?,?,?,?)",
+            (username, prev, status, ts_iso, "initial" if initial else source),
+        )
+        if initial:
+            await self._exec("UPDATE mentees SET last_status=? WHERE username=?", (status, username))
+            return False
+        await self._exec(
+            "UPDATE mentees SET last_status=?, status_since=? WHERE username=?",
+            (status, ts_iso, username),
+        )
+        return True
+
+    async def status_history(self, username=None):
+        if username is None:
+            return await self._all("SELECT * FROM status_history ORDER BY username, ts, id")
+        return await self._all(
+            "SELECT * FROM status_history WHERE username=? ORDER BY ts, id", (username,)
+        )
 
     async def set_pause(self, username, until_iso):
         await self._exec("UPDATE mentees SET paused_until=? WHERE username=?", (until_iso, username))
@@ -147,9 +185,11 @@ class Repo:
         )
 
     # proposals
-    async def add_proposal(self, username, new_status) -> int:
+    async def add_proposal(self, username, new_status, from_status=None) -> int:
+        """from_status — статус на момент предложения; None — не сверять (старые записи)."""
         cur = await self._c.execute(
-            "INSERT INTO proposals(username, new_status) VALUES (?,?)", (username, new_status)
+            "INSERT INTO proposals(username, new_status, from_status) VALUES (?,?,?)",
+            (username, new_status, from_status),
         )
         await self._c.commit()
         return cur.lastrowid

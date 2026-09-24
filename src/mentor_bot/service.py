@@ -1,5 +1,5 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -28,9 +28,23 @@ class Service:
     async def sync_mentees(self):
         mentees = await self.sheets.load_mentees()
         self.by_username = {m.username: m for m in mentees}
+        now_iso = datetime.now(timezone.utc).isoformat()
         for m in mentees:
             await self.repo.upsert_mentee(m.username, sheet_title=m.sheet_title, row=m.row)
+            # ручные правки статуса в таблице тоже попадают в историю и сдвигают status_since
+            await self.repo.record_status(m.username, m.status, now_iso, "sheet")
         return self.by_username
+
+    async def _propose(self, username: str, m, new_status: str, text: str, prefix: str,
+                       hint: str = ""):
+        if (m.status or "").strip() == new_status.strip():
+            return  # статус уже такой — спрашивать нечего
+        pid = await self.repo.add_proposal(username, new_status, m.status or "")
+        await self.sender.notify_mentor(
+            f"📋 {prefix}: {text[:200]}\n"
+            f"Сменить статус «{m.status or '—'}» → «{new_status}»?{hint}",
+            reply_markup=_kb([[("Да", f"st:yes:{pid}"), ("Нет", f"st:no:{pid}")]]),
+        )
 
     async def _touch_sheet_date(self, username: str, ts_iso: str):
         m = self.by_username.get(username)
@@ -80,12 +94,7 @@ class Service:
         upd = await self.llm.parse_mentor_verdict(text, m.status)
         if not upd.new_status:
             return
-        pid = await self.repo.add_proposal(username, upd.new_status)
-        await self.sender.notify_mentor(
-            f"📋 Ты написал @{username}: {text[:200]}\n"
-            f"Сменить статус на «{upd.new_status}»?",
-            reply_markup=_kb([[("Да", f"st:yes:{pid}"), ("Нет", f"st:no:{pid}")]]),
-        )
+        await self._propose(username, m, upd.new_status, text, f"Ты написал @{username}")
 
     async def on_incoming(self, username: str, text: str, ts_iso: str):
         await self.repo.log_message(username, "in", text, ts_iso)
@@ -115,13 +124,9 @@ class Service:
         elif kind == "progress":
             upd = await self.llm.parse_status(text, m.status if m else None)
             if upd.new_status and m is not None:
-                pid = await self.repo.add_proposal(username, upd.new_status)
                 hint = "уверенно" if upd.confidence == "high" else "под вопросом"
-                await self.sender.notify_mentor(
-                    f"📋 @{username} написал: {text[:200]}\n"
-                    f"Сменить статус на «{upd.new_status}»? ({hint})",
-                    reply_markup=_kb([[("Да", f"st:yes:{pid}"), ("Нет", f"st:no:{pid}")]]),
-                )
+                await self._propose(username, m, upd.new_status, text, f"@{username} написал",
+                                    f" ({hint})")
     async def on_unknown_chat(self, username: str, display: str):
         titles = self.settings.active_sheet_titles
         buttons = [[(t, f"add:{i}:{username}")] for i, t in enumerate(titles)]

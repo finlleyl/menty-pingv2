@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 from aiogram import F, Router
 from aiogram.types import CallbackQuery
 
+from mentor_bot.sheets import RowNotFound, StatusConflict
+
 log = logging.getLogger(__name__)
 
 
@@ -39,11 +41,21 @@ async def handle_st_callback(data: str, repo, sender, service) -> str:
         await repo.delete_proposal(p["id"])
         return "Менти не найден в таблице"
     try:
-        await service.sheets.set_status(m, p["new_status"])
+        # сверка с таблицей: кнопка могла пролежать неделю, а статус с тех пор сменился
+        await service.sheets.set_status(m, p["new_status"], expected=p.get("from_status"))
+    except StatusConflict as e:
+        await repo.delete_proposal(p["id"])
+        m.status = e.current or None
+        return f"Статус уже «{e.current or '—'}» — предложение устарело, не трогаю"
+    except RowNotFound:
+        await repo.delete_proposal(p["id"])
+        return f"@{p['username']} больше нет в таблице"
     except Exception:
+        log.exception("set_status failed for @%s", p["username"])
         return "Ошибка записи в таблицу, нажми ещё раз"
     m.status = p["new_status"]
-    await repo.set_status_since(p["username"], datetime.now(timezone.utc).isoformat())
+    await repo.record_status(p["username"], p["new_status"],
+                             datetime.now(timezone.utc).isoformat(), "bot")
     await repo.delete_proposal(p["id"])
     return f"Статус @{p['username']} → «{p['new_status']}»"
 

@@ -23,7 +23,10 @@ class FakeSheets:
     async def set_date(self, m, d):
         self.dates.append((m.username, d))
 
-    async def set_status(self, m, s):
+    async def set_status(self, m, s, expected=None):
+        from mentor_bot.sheets import StatusConflict
+        if expected is not None and (m.status or "") != expected:
+            raise StatusConflict(m.status or "")
         self.statuses.append((m.username, s))
 
     async def append_mentee(self, title, display):
@@ -231,3 +234,27 @@ async def test_verdict_llm_failure_does_not_break_outgoing(tmp_path):
     await svc.on_outgoing("ivan", "сдан спринт 1", "2026-08-19T10:00:00+00:00")
     # сообщение всё равно залогировано, бот не упал
     assert (await repo.last_message_ts("ivan")) == "2026-08-19T10:00:00+00:00"
+
+
+async def test_manual_sheet_status_change_moves_status_since(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    sheets = FakeSheets([sm(status="Спринт 4")])
+    svc = Service(repo, sheets, FakeLLM(), FakeSender(), FakeKB(), FakeSettings())
+    await svc.sync_mentees()
+    await repo.set_status_since("ivan", "2026-06-01T10:00:00+00:00")   # старое подтверждение кнопкой
+    sheets.mentees[0].status = "Резюме"                                  # ментор поменял руками
+    await svc.sync_mentees()
+    rec = await repo.get_mentee("ivan")
+    assert rec["status_since"] > "2026-09-01"
+    await repo.close()
+
+
+async def test_no_proposal_when_status_unchanged(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    sender = FakeSender()
+    llm = FakeLLM(kind="progress", status=StatusUpdate(new_status="3 спринт", confidence="high"))
+    svc = Service(repo, FakeSheets([sm()]), llm, sender, FakeKB(), FakeSettings())
+    await svc.sync_mentees()
+    await svc.handle_buffered("ivan", "я всё ещё на третьем", "2026-08-19T10:00:00+00:00")
+    assert sender.mentor_msgs == []
+    await repo.close()

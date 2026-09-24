@@ -90,3 +90,23 @@ async def test_status_since_stamped_and_migrated(tmp_path):
     await repo.set_status_since("petr", "2026-08-27T10:00:00+00:00")   # ещё не заведён
     assert (await repo.get_mentee("petr"))["status_since"] == "2026-08-27T10:00:00+00:00"
     await repo.close()
+
+
+async def test_record_status_initial_then_transition(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    # первое наблюдение: когда ученик попал в статус — неизвестно, status_since не трогаем
+    assert await repo.record_status("ivan", "Спринт 1", "2026-08-01T10:00:00+00:00", "sheet") is False
+    assert (await repo.get_mentee("ivan"))["status_since"] is None
+    assert await repo.record_status("ivan", "Спринт 1", "2026-08-02T10:00:00+00:00", "sheet") is False
+    assert await repo.record_status("ivan", "Спринт 2", "2026-08-03T10:00:00+00:00", "sheet") is True
+    rec = await repo.get_mentee("ivan")
+    assert rec["status_since"] == "2026-08-03T10:00:00+00:00" and rec["last_status"] == "Спринт 2"
+    assert [h["source"] for h in await repo.status_history("ivan")] == ["initial", "sheet"]
+    await repo.close()
+
+
+async def test_proposal_keeps_from_status(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    pid = await repo.add_proposal("ivan", "Резюме", from_status="Спринт 4")
+    assert (await repo.get_proposal(pid))["from_status"] == "Спринт 4"
+    await repo.close()

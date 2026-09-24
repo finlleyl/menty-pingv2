@@ -43,6 +43,19 @@ class SheetMentee:
     notes: str = ""
     dossier: str = ""
     dossier_col: int = 0   # 1-based; 0 — колонки «Досье» в листе нет
+    mentee_col: int = 0    # 1-based; 0 — строку перед записью не сверяем
+
+
+class RowNotFound(Exception):
+    """Менти больше нет в листе: строку удалили или ник поменяли."""
+
+
+class StatusConflict(Exception):
+    """Статус в таблице уже не тот, от которого считалось предложение."""
+
+    def __init__(self, current: str):
+        super().__init__(current)
+        self.current = current
 
 
 def _guess_mentee_col(rows, header_row: int, exclude: set[int]):
@@ -111,6 +124,7 @@ def parse_sheet(title: str, rows) -> list[SheetMentee]:
             row=ri + 1, date_col=hm.date_col + 1, status_col=hm.status_col + 1,
             notes=cell_at(hm.notes_col), dossier=cell_at(hm.dossier_col),
             dossier_col=(hm.dossier_col + 1) if hm.dossier_col is not None else 0,
+            mentee_col=hm.mentee_col + 1,
         ))
     return out
 
@@ -139,15 +153,40 @@ class SheetsClient:
             return result
         return await asyncio.to_thread(work)
 
-    async def set_date(self, m: SheetMentee, d: date):
-        await asyncio.to_thread(
-            lambda: self._open().worksheet(m.sheet_title).update_cell(m.row, m.date_col, format_date(d))
-        )
+    @staticmethod
+    def _locate(ws, m: SheetMentee) -> int:
+        """Актуальная строка менти. Кэш строк живёт часами, а лист могли отсортировать
+        или вставить строку — писать по старому номеру значит писать в чужую строку.
+        Поэтому перед записью сверяем ник и при расхождении ищем его заново."""
+        if not m.mentee_col:
+            return m.row
+        col = ws.col_values(m.mentee_col)
+        if m.row <= len(col) and extract_username(col[m.row - 1]) == m.username:
+            return m.row
+        for i, cell in enumerate(col):
+            if extract_username(cell) == m.username:
+                m.row = i + 1
+                return m.row
+        raise RowNotFound(m.username)
 
-    async def set_status(self, m: SheetMentee, status: str):
-        await asyncio.to_thread(
-            lambda: self._open().worksheet(m.sheet_title).update_cell(m.row, m.status_col, status)
-        )
+    async def set_date(self, m: SheetMentee, d: date):
+        def work():
+            ws = self._open().worksheet(m.sheet_title)
+            ws.update_cell(self._locate(ws, m), m.date_col, format_date(d))
+        await asyncio.to_thread(work)
+
+    async def set_status(self, m: SheetMentee, status: str, expected: str | None = None):
+        """expected — статус, от которого считалось предложение. Если в таблице уже
+        другой (ментор поменял руками или нажал более свежую кнопку) — StatusConflict."""
+        def work():
+            ws = self._open().worksheet(m.sheet_title)
+            row = self._locate(ws, m)
+            if expected is not None:
+                current = (ws.cell(row, m.status_col).value or "").strip()
+                if current != expected.strip():
+                    raise StatusConflict(current)
+            ws.update_cell(row, m.status_col, status)
+        await asyncio.to_thread(work)
 
     async def append_mentee(self, title: str, display: str):
         def work():
@@ -178,6 +217,7 @@ class SheetsClient:
     async def set_dossier(self, m: SheetMentee, text: str):
         if not m.dossier_col:
             return  # колонки «Досье» в листе нет — писать некуда
-        await asyncio.to_thread(
-            lambda: self._open().worksheet(m.sheet_title).update_cell(m.row, m.dossier_col, text)
-        )
+        def work():
+            ws = self._open().worksheet(m.sheet_title)
+            ws.update_cell(self._locate(ws, m), m.dossier_col, text)
+        await asyncio.to_thread(work)
