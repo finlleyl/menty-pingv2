@@ -50,7 +50,8 @@ class FakeLLM:
     async def parse_mentor_verdict(self, text, current):
         return StatusUpdate(new_status=None, confidence="low")
 
-    async def draft_answer(self, q, chunks, profile):
+    async def draft_answer(self, q, chunks, profile, examples=None, similar=None):
+        self.draft_ctx = {"examples": examples, "similar": similar}
         return f"ЧЕРНОВИК[{q}]"
 
     async def update_profile(self, old, recent, notes=None):
@@ -257,4 +258,34 @@ async def test_no_proposal_when_status_unchanged(tmp_path):
     await svc.sync_mentees()
     await svc.handle_buffered("ivan", "я всё ещё на третьем", "2026-08-19T10:00:00+00:00")
     assert sender.mentor_msgs == []
+    await repo.close()
+
+
+async def test_manual_answer_is_remembered_and_reused_for_similar_question(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    llm = FakeLLM(kind="question")
+    sender = FakeSender()
+    svc = Service(repo, FakeSheets([sm()]), llm, sender, FakeKB(), FakeSettings())
+    await svc.sync_mentees()
+    # первый вопрос: черновик ментор не отправил, а ответил в чате сам
+    await svc.handle_buffered("ivan", "как закрыть канал?", "2026-08-19T10:00:00+00:00")
+    await svc.on_outgoing("ivan", "закрывает только отправитель", "2026-08-19T10:05:00+00:00")
+    rows = await repo.answered_questions()
+    assert [r["final"] for r in rows] == ["закрывает только отправитель"]
+    # похожий вопрос (FakeLLM.embed даёт тот же вектор) — прошлый ответ ушёл в контекст черновика
+    await svc.handle_buffered("ivan", "кто закрывает канал?", "2026-08-20T10:00:00+00:00")
+    assert [s["final"] for s in llm.draft_ctx["similar"]] == ["закрывает только отправитель"]
+    assert "похожее: 1" in sender.mentor_msgs[-1][0]
+    await repo.close()
+
+
+async def test_dissimilar_answers_are_not_used(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    llm = FakeLLM(kind="question")
+    svc = Service(repo, FakeSheets([sm()]), llm, FakeSender(), FakeKB(), FakeSettings())
+    await svc.sync_mentees()
+    qid = await repo.add_question("ivan", "про мапы", "ч", "2026-08-19T10:00:00+00:00", emb=[0.0, 1.0])
+    await repo.set_question_final(qid, "ответ про мапы")
+    await svc.handle_buffered("ivan", "про каналы", "2026-08-20T10:00:00+00:00")   # эмбеддинг [1, 0]
+    assert llm.draft_ctx["similar"] == []
     await repo.close()

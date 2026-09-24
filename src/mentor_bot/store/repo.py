@@ -152,10 +152,10 @@ class Repo:
         return row["ts"] if row else None
 
     # questions
-    async def add_question(self, username, question, draft, ts_iso) -> int:
+    async def add_question(self, username, question, draft, ts_iso, emb=None) -> int:
         cur = await self._c.execute(
-            "INSERT INTO questions(username, question, draft, created_ts) VALUES (?,?,?,?)",
-            (username, question, draft, ts_iso),
+            "INSERT INTO questions(username, question, draft, created_ts, emb) VALUES (?,?,?,?,?)",
+            (username, question, draft, ts_iso, json.dumps(emb) if emb is not None else None),
         )
         await self._c.commit()
         return cur.lastrowid
@@ -165,6 +165,36 @@ class Repo:
 
     async def set_question_state(self, qid, state):
         await self._exec("UPDATE questions SET state=? WHERE id=?", (state, qid))
+
+    async def set_question_final(self, qid, final):
+        """Что в итоге ушло ученику: черновик как есть или правка ментора."""
+        await self._exec("UPDATE questions SET final=? WHERE id=?", (final, qid))
+
+    async def record_manual_answer(self, username, text):
+        """Ментор ответил в чате сам — это и есть ответ на открытые вопросы."""
+        await self._exec(
+            "UPDATE questions SET final=? WHERE username=? AND state='open' AND final IS NULL",
+            (text, username),
+        )
+
+    async def edit_examples(self, limit=5):
+        """Последние случаи, когда ментор ответил не так, как предлагал черновик."""
+        return await self._all(
+            "SELECT question, draft, final FROM questions "
+            "WHERE final IS NOT NULL AND final != draft ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+
+    async def answered_questions(self, limit=500):
+        """Вопросы с настоящим ответом ментора и эмбеддингом вопроса — для поиска похожих."""
+        rows = await self._all(
+            "SELECT question, final, emb FROM questions "
+            "WHERE final IS NOT NULL AND emb IS NOT NULL ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+        for r in rows:
+            r["emb"] = json.loads(r["emb"])
+        return rows
 
     async def open_questions(self, older_than_iso=None, unreminded_only=False):
         sql = "SELECT * FROM questions WHERE state='open'"

@@ -2,11 +2,16 @@ import logging
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+import numpy as np
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from mentor_bot.llm import looks_like_verdict
 
 log = logging.getLogger(__name__)
+
+# Порог косинусной близости, с которого прошлый вопрос считаем «тем же самым».
+# Для text-embedding-3-small перефразировки одного вопроса обычно выше 0.7, разные темы — ниже.
+SIMILAR_MIN = 0.7
 
 
 def _kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
@@ -72,6 +77,8 @@ class Service:
     async def on_outgoing(self, username: str, text: str, ts_iso: str):
         await self.repo.log_message(username, "out", text, ts_iso)
         await self.repo.reset_unanswered(username)
+        # ответ ментора своими словами — лучший пример для будущих черновиков
+        await self.repo.record_manual_answer(username, text)
         await self.repo.close_open_questions(username)
         # ментор ответил сам — накопленное обрабатывать не нужно
         await self.repo.drop_pending(username)
@@ -115,11 +122,16 @@ class Service:
             emb = (await self.llm.embed([text]))[0]
             chunks = self.kb.search(text, emb, k=5)
             profile = await self.repo.get_profile(username)
-            draft = await self.llm.draft_answer(text, chunks, profile)
-            qid = await self.repo.add_question(username, text, draft, ts_iso)
+            similar = await self._similar_answers(emb)
+            examples = await self.repo.edit_examples(5)
+            draft = await self.llm.draft_answer(text, chunks, profile,
+                                                examples=examples, similar=similar)
+            qid = await self.repo.add_question(username, text, draft, ts_iso, emb=emb)
+            note = f"\n\n(учтено твоих прошлых ответов на похожее: {len(similar)})" if similar else ""
             await self.sender.notify_mentor(
-                f"❓ @{username} спрашивает:\n{text}\n\nЧЕРНОВИК:\n{draft}",
-                reply_markup=_kb([[("Отправить", f"q:send:{qid}"), ("Игнор", f"q:ign:{qid}")]]),
+                f"❓ @{username} спрашивает:\n{text}\n\nЧЕРНОВИК:\n{draft}{note}",
+                reply_markup=_kb([[("Отправить", f"q:send:{qid}"), ("✏️ Править", f"q:edit:{qid}"),
+                                   ("Игнор", f"q:ign:{qid}")]]),
             )
         elif kind == "progress":
             upd = await self.llm.parse_status(text, m.status if m else None)
@@ -127,6 +139,17 @@ class Service:
                 hint = "уверенно" if upd.confidence == "high" else "под вопросом"
                 await self._propose(username, m, upd.new_status, text, f"@{username} написал",
                                     f" ({hint})")
+    async def _similar_answers(self, emb, k: int = 3):
+        """Прошлые вопросы, близкие по смыслу, вместе с тем, что ментор на них ответил."""
+        rows = await self.repo.answered_questions()
+        if not rows:
+            return []
+        mat = np.array([r["emb"] for r in rows], dtype=np.float32)
+        q = np.array(emb, dtype=np.float32)
+        sims = mat @ q / (np.linalg.norm(mat, axis=1) * (np.linalg.norm(q) or 1e-9) + 1e-9)
+        top = [i for i in np.argsort(-sims)[:k] if sims[i] >= SIMILAR_MIN]
+        return [rows[i] for i in top]
+
     async def on_unknown_chat(self, username: str, display: str):
         titles = self.settings.active_sheet_titles
         buttons = [[(t, f"add:{i}:{username}")] for i, t in enumerate(titles)]

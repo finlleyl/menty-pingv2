@@ -9,11 +9,21 @@ from mentor_bot.sheets import RowNotFound, StatusConflict
 log = logging.getLogger(__name__)
 
 
+EDIT_KEY = "edit_target"
+
+
 async def handle_q_callback(data: str, repo, sender, service) -> str:
     _, action, qid = data.split(":")
     q = await repo.get_question(int(qid))
     if not q or q["state"] != "open":
         return "Уже обработано"
+    if action == "edit":
+        await repo.set_setting(EDIT_KEY, f"q:{q['id']}")
+        await sender.notify_mentor(
+            f"✏️ Пришли одним сообщением ответ для @{q['username']} — отправлю его вместо черновика. "
+            f"/cancel — передумал."
+        )
+        return "Жду текст"
     if action == "send":
         try:
             result = await sender.send_to_mentee(q["username"], q["draft"])
@@ -22,10 +32,44 @@ async def handle_q_callback(data: str, repo, sender, service) -> str:
             return "Ошибка отправки, попробуй ещё раз"
         if result in ("sent", "dry"):
             await repo.set_question_state(q["id"], "sent")
+            await repo.set_question_final(q["id"], q["draft"])
             return "Отправлено" if result == "sent" else "Dry-run: ушло тебе"
         return f"Не отправлено: {result}"
     await repo.set_question_state(q["id"], "ignored")
     return "Ок, игнорирую"
+
+
+async def handle_edit_text(text: str, repo, sender, service) -> str | None:
+    """Текст ментора в личке бота после «✏️ Править». None — правка не ожидалась."""
+    target = await repo.get_setting(EDIT_KEY)
+    if not target:
+        return None
+    kind, _, ident = target.partition(":")
+    if kind == "q":
+        q = await repo.get_question(int(ident))
+        if not q or q["state"] != "open":
+            await repo.set_setting(EDIT_KEY, "")
+            return "Вопрос уже закрыт — ничего не отправил"
+        try:
+            result = await sender.send_to_mentee(q["username"], text)
+        except Exception:
+            log.exception("send_to_mentee failed for @%s", q["username"])
+            return "Ошибка отправки — пришли текст ещё раз или /cancel"
+        if result not in ("sent", "dry"):
+            return f"Не отправлено: {result}. Пришли ещё раз или /cancel"
+        await repo.set_question_state(q["id"], "sent")
+        await repo.set_question_final(q["id"], text)
+        await repo.set_setting(EDIT_KEY, "")
+        return f"Отправил @{q['username']} твой вариант" if result == "sent" else "Dry-run: ушло тебе"
+    if kind == "p":
+        from mentor_bot.jobs import send_ping_draft
+        out = await send_ping_draft(int(ident), service, repo, sender, service.settings, text=text)
+        if out.retry:
+            return out.message + " Пришли ещё раз или /cancel"
+        await repo.set_setting(EDIT_KEY, "")
+        return out.message
+    await repo.set_setting(EDIT_KEY, "")
+    return None
 
 
 async def handle_st_callback(data: str, repo, sender, service) -> str:

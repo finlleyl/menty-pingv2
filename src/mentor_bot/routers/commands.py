@@ -8,8 +8,17 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 from mentor_bot.pings import effective_last_contact, should_ping
+from mentor_bot.routers.callbacks import EDIT_KEY, handle_edit_text
 
 _bg_tasks: set = set()
+
+HELP = (
+    "/status — сводка\n/digest — недельная сводка по воронке\n/fails — на чём срезаются на собесах\n"
+    "/pause @user N — пауза пингов\n/pause_all, /resume_all — стоп-кран\n"
+    "/dryrun on|off — тестовый режим\n/pingmode auto|review — пинги сами или через тебя\n"
+    "/cost [дней] — расходы на LLM\n/backup — бэкап базы файлом\n"
+    "/cancel — отменить правку черновика\n/reindex — обновить базу знаний"
+)
 
 
 def _listing(usernames: list[str], limit: int = 30) -> str:
@@ -148,11 +157,19 @@ def make_router(service, repo, sender, settings, reindex_fn, backup_fn=None) -> 
         except Exception as e:
             await message.answer(f"⚠️ Бэкап упал: {e}")
 
+    @router.message(Command("cancel"))
+    async def cmd_cancel(message: Message):
+        await repo.set_setting(EDIT_KEY, "")
+        await message.answer("Ок, правку отменил")
+
     @router.message(Command("start", "help"))
     async def cmd_help(message: Message):
-        await message.answer(
-            "/status — сводка\n/pause @user N — пауза пингов\n/pause_all, /resume_all — стоп-кран\n"
-            "/dryrun on|off — тестовый режим\n/reindex — обновить базу знаний"
-        )
+        await message.answer(HELP)
+
+    @router.message(F.text & ~F.text.startswith("/"))
+    async def on_text(message: Message):
+        # обычный текст в личке бота — это правка черновика после кнопки «✏️ Править»
+        reply = await handle_edit_text(message.text, repo, sender, service)
+        await message.answer(reply or "Правку ничего не ждёт. /help — список команд")
 
     return router

@@ -148,3 +148,38 @@ async def test_st_yes_writes_history(tmp_path):
     svc.sheets.mentees[0].status = "Спринт 4"
     await svc.sync_mentees()
     assert len(await repo.status_history("ivan")) == 2
+
+
+async def test_edit_flow_sends_mentor_text_and_remembers_it(tmp_path):
+    from mentor_bot.routers.callbacks import handle_edit_text
+    repo, sheets, sender, svc = await make(tmp_path)
+    qid = await repo.add_question("ivan", "как закрыть канал?", "черновик", "2026-08-19T10:00:00+00:00")
+    assert await handle_edit_text("просто текст", repo, sender, svc) is None   # правку никто не ждёт
+    assert await handle_q_callback(f"q:edit:{qid}", repo, sender, svc) == "Жду текст"
+    out = await handle_edit_text("close(ch), но только со стороны отправителя", repo, sender, svc)
+    assert "твой вариант" in out
+    assert sender.mentee_msgs == [("ivan", "close(ch), но только со стороны отправителя")]
+    q = await repo.get_question(qid)
+    assert q["state"] == "sent" and q["final"].startswith("close(ch)")
+    assert await repo.edit_examples() == [
+        {"question": "как закрыть канал?", "draft": "черновик", "final": q["final"]}
+    ]
+    assert await handle_edit_text("ещё текст", repo, sender, svc) is None      # режим правки снят
+
+
+async def test_edit_of_closed_question_sends_nothing(tmp_path):
+    from mentor_bot.routers.callbacks import handle_edit_text
+    repo, sheets, sender, svc = await make(tmp_path)
+    qid = await repo.add_question("ivan", "вопрос", "черновик", "2026-08-19T10:00:00+00:00")
+    await handle_q_callback(f"q:edit:{qid}", repo, sender, svc)
+    await repo.set_question_state(qid, "answered")     # тем временем ответил в чате сам
+    assert "закрыт" in await handle_edit_text("текст", repo, sender, svc)
+    assert sender.mentee_msgs == []
+
+
+async def test_send_as_is_records_final(tmp_path):
+    repo, sheets, sender, svc = await make(tmp_path)
+    qid = await repo.add_question("ivan", "вопрос", "черновик", "2026-08-19T10:00:00+00:00")
+    await handle_q_callback(f"q:send:{qid}", repo, sender, svc)
+    assert (await repo.get_question(qid))["final"] == "черновик"
+    assert await repo.edit_examples() == []        # не правка — в примеры стиля не идёт
