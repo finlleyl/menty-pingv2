@@ -80,6 +80,8 @@ DRAFT_SYS = (
     "Ты готовишь ментору по Go-разработке ЧЕРНОВИК ответа на вопрос ученика. "
     "Отвечай ТОЛЬКО на основе приложенных выдержек из материалов курса; если в материалах ответа нет — "
     "так и напиши в черновике ('в материалах нет, ответь сам'). Стиль: неформальный, на «ты», по делу. "
+    "Если ответ взят из материалов, в конце одной строкой подскажи, где почитать подробнее, — "
+    "по пометкам «Источник» у выдержек (например: «подробнее — урок „Каналы“»). "
     "Верни только текст ответа."
 )
 
@@ -105,6 +107,12 @@ def _is_outage(e: Exception) -> bool:
     if isinstance(e, openai.APIStatusError):
         return e.status_code in _OUTAGE_STATUSES or e.status_code >= 500
     return False
+
+
+def _chunk_text(c) -> str:
+    if isinstance(c, str):
+        return c
+    return f"[Источник: {c['source']}]\n{c['text']}" if c.get("source") else c["text"]
 
 
 def _dialog(recent: list[dict]) -> str:
@@ -198,7 +206,7 @@ class LLM:
         return out.text
 
     async def draft_answer(self, question, chunks, profile) -> str:
-        ctx = "\n\n---\n\n".join(chunks) or "(материалы не найдены)"
+        ctx = "\n\n---\n\n".join(_chunk_text(c) for c in chunks) or "(материалы не найдены)"
         user = f"Вопрос ученика: {question}\n\nДосье: {profile or 'нет'}\n\nМатериалы курса:\n{ctx}"
         out: PlainText = await self._parse(self.smart, DRAFT_SYS, user, PlainText, "draft")
         return out.text

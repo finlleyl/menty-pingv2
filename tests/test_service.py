@@ -73,7 +73,7 @@ class FakeSender:
 
 class FakeKB:
     def search(self, q, emb, k=5):
-        return ["из материалов"]
+        return [{"text": "из материалов", "source": "урок «Каналы»"}]
 
 
 class FakeSettings:

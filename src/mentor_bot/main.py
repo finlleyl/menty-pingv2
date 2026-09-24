@@ -60,15 +60,18 @@ async def main():
         try:
             docs = await crawl(settings.edu_base_url, settings.edu_email, settings.edu_password)
             chunks: list[str] = []
-            for doc in docs:
-                chunks.extend(split_markdown(doc))
+            sources: list[str] = []
+            for source, doc in docs:
+                parts = split_markdown(doc)
+                chunks.extend(parts)
+                sources.extend([source] * len(parts))
             if not chunks:
                 await sender.notify_mentor("⚠️ Reindex: контент не скачался (проверь EDU_EMAIL/EDU_PASSWORD)")
                 return
             embeddings: list[list[float]] = []
             for i in range(0, len(chunks), 100):
                 embeddings.extend(await llm.embed(chunks[i:i + 100]))
-            kb.build(chunks, embeddings)
+            kb.build(chunks, embeddings, sources)
             await sender.notify_mentor(f"✅ База знаний обновлена: {len(chunks)} фрагментов")
         except Exception as e:
             log.exception("reindex failed")
