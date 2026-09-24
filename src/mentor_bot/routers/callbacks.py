@@ -120,6 +120,24 @@ async def handle_add_callback(data: str, repo, sender, service) -> str:
     return f"Добавил @{username} в «{title}»"
 
 
+async def handle_p_callback(data: str, repo, sender, service) -> str:
+    from mentor_bot.jobs import send_ping_draft
+    _, action, pid = data.split(":")
+    d = await repo.get_ping_draft(int(pid))
+    if not d or d["state"] != "open":
+        return "Уже обработано"
+    if action == "skip":
+        await repo.set_ping_draft_state(d["id"], "skipped")
+        return "Ок, этот пинг пропускаю"
+    if action == "edit":
+        await repo.set_setting(EDIT_KEY, f"p:{d['id']}")
+        await sender.notify_mentor(
+            f"✏️ Пришли одним сообщением пинг для @{d['username']} — отправлю его. /cancel — передумал."
+        )
+        return "Жду текст"
+    return (await send_ping_draft(d["id"], service, repo, sender, service.settings)).message
+
+
 def make_router(service, repo, sender) -> Router:
     router = Router()
 
@@ -130,6 +148,10 @@ def make_router(service, repo, sender) -> Router:
     @router.callback_query(F.data.startswith("st:"))
     async def on_st(cb: CallbackQuery):
         await cb.answer(await handle_st_callback(cb.data, repo, sender, service))
+
+    @router.callback_query(F.data.startswith("p:"))
+    async def on_p(cb: CallbackQuery):
+        await cb.answer(await handle_p_callback(cb.data, repo, sender, service))
 
     @router.callback_query(F.data.startswith("add:"))
     async def on_add(cb: CallbackQuery):

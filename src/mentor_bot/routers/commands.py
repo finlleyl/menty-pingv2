@@ -99,6 +99,17 @@ async def handle_dryrun(args: str, repo) -> str:
     return f"dry-run: {val.upper()}"
 
 
+async def handle_pingmode(args: str, repo) -> str:
+    val = args.strip().lower()
+    if val not in ("auto", "review"):
+        cur = await repo.get_setting("ping_mode", "auto")
+        return f"Сейчас: {cur}. Формат: /pingmode auto|review"
+    await repo.set_setting("ping_mode", val)
+    if val == "review":
+        return "Пинги теперь приходят тебе с кнопками «Отправить / Править / Пропустить»"
+    return "Пинги уходят сами (кроме тех, что не прошли проверку тем)"
+
+
 async def handle_pause_all(repo, on: bool) -> str:
     await repo.set_setting("pause_all", "1" if on else "0")
     return "Стоп-кран ВКЛ: ничего не шлю" if on else "Стоп-кран выключен"
@@ -135,6 +146,10 @@ def make_router(service, repo, sender, settings, reindex_fn, backup_fn=None) -> 
     @router.message(Command("dryrun"))
     async def cmd_dryrun(message: Message):
         await message.answer(await handle_dryrun(args_of(message), repo))
+
+    @router.message(Command("pingmode"))
+    async def cmd_pingmode(message: Message):
+        await message.answer(await handle_pingmode(args_of(message), repo))
 
     @router.message(Command("reindex"))
     async def cmd_reindex(message: Message):

@@ -295,3 +295,86 @@ async def test_dossier_cycle_leaves_profile_stale_when_sheet_write_fails(tmp_pat
     # запись в таблицу не прошла — досье не помечено свежим, завтра попробуем снова
     assert await repo.get_profile("ivan") is None
     assert await repo.stale_profiles() == ["ivan"]
+
+
+async def test_forbidden_topic_triggers_regeneration(tmp_path):
+    repo, sheets, sender, llm, svc = await make(tmp_path)
+    await repo.upsert_mentee("ivan", chat_id=1)
+    await repo.set_setting("dryrun", "0")
+    await repo.set_setting("bconn", "conn1")
+    seen_avoid = []
+
+    async def gen_ping(display, status, recent, profile, notes=None, avoid=None):
+        seen_avoid.append(avoid)
+        return "Как спринт? Резюме уже набросал?" if avoid is None else "Как спринт, где застрял?"
+
+    llm.gen_ping = gen_ping
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC)
+    assert seen_avoid == [None, ["резюме"]]
+    assert sender.mentee_msgs == [("ivan", "Как спринт, где застрял?")]
+
+
+async def test_repeated_violation_goes_to_mentor_instead_of_mentee(tmp_path):
+    repo, sheets, sender, llm, svc = await make(tmp_path)
+    await repo.upsert_mentee("ivan", chat_id=1)
+    await repo.set_setting("dryrun", "0")
+    await repo.set_setting("bconn", "conn1")
+
+    async def gen_ping(*a, **kw):
+        return "Как спринт? Резюме уже набросал?"
+
+    llm.gen_ping = gen_ping
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC)
+    assert sender.mentee_msgs == []
+    text, kb = sender.mentor_msgs[-1]
+    assert "запрещённое" in text and kb.inline_keyboard[0][0].callback_data.startswith("p:send:")
+    assert (await repo.get_mentee("ivan"))["unanswered_pings"] == 0
+
+
+async def test_review_mode_then_approve(tmp_path):
+    from mentor_bot.routers.callbacks import handle_p_callback
+    repo, sheets, sender, llm, svc = await make(tmp_path)
+    await repo.upsert_mentee("ivan", chat_id=1)
+    await repo.set_setting("dryrun", "0")
+    await repo.set_setting("bconn", "conn1")
+    await repo.set_setting("ping_mode", "review")
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC)
+    assert sender.mentee_msgs == []
+    pid = (await repo.open_ping_draft("ivan"))["id"]
+    # следующий час: черновик ещё открыт — второй не готовим и LLM не дёргаем
+    llm.gen_ping_calls.clear()
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC + timedelta(days=1))
+    assert llm.gen_ping_calls == []
+    out = await handle_p_callback(f"p:send:{pid}", repo, sender, svc)
+    assert "отправлен" in out
+    assert sender.mentee_msgs == [("ivan", "ПИНГ[Иван @ivan]")]
+    assert (await repo.get_mentee("ivan"))["unanswered_pings"] == 1
+    assert sheets.dates   # дата в таблице обновлена так же, как при автопинге
+    assert await handle_p_callback(f"p:send:{pid}", repo, sender, svc) == "Уже обработано"
+
+
+async def test_ping_draft_goes_stale_when_mentee_writes(tmp_path):
+    from mentor_bot.routers.callbacks import handle_p_callback
+    repo, sheets, sender, llm, svc = await make(tmp_path)
+    await svc.sync_mentees()
+    pid = await repo.add_ping_draft("ivan", "куда пропал?", "2026-08-20T12:00:00+00:00")
+    await repo.log_message("ivan", "in", "я тут", "2026-08-20T13:00:00+00:00")   # мимо on_incoming
+    out = await handle_p_callback(f"p:send:{pid}", repo, sender, svc)
+    assert "неактуален" in out and sender.mentee_msgs == []
+    # обычный путь: входящее сообщение сразу закрывает ждущий черновик
+    pid2 = await repo.add_ping_draft("ivan", "куда пропал?", "2026-08-21T12:00:00+00:00")
+    await svc.on_incoming("ivan", "привет", "2026-08-21T13:00:00+00:00")
+    assert (await repo.get_ping_draft(pid2))["state"] == "stale"
+
+
+async def test_edited_ping_is_sent(tmp_path):
+    from mentor_bot.routers.callbacks import handle_edit_text, handle_p_callback
+    repo, sheets, sender, llm, svc = await make(tmp_path)
+    await svc.sync_mentees()
+    await repo.set_setting("dryrun", "0")
+    pid = await repo.add_ping_draft("ivan", "куда пропал?", "2026-08-20T12:00:00+00:00")
+    await handle_p_callback(f"p:edit:{pid}", repo, sender, svc)
+    out = await handle_edit_text("Ну что, как третий спринт?", repo, sender, svc)
+    assert "отправлен" in out
+    assert sender.mentee_msgs == [("ivan", "Ну что, как третий спринт?")]
+    assert (await repo.get_ping_draft(pid))["state"] == "sent"

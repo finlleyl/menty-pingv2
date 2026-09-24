@@ -186,7 +186,7 @@ class LLM:
             "verdict",
         )
 
-    async def gen_ping(self, display, status, recent, profile, notes=None) -> str:
+    async def gen_ping(self, display, status, recent, profile, notes=None, avoid=None) -> str:
         stage = parse_stage(status)
         allowed, forbidden = ping_topics(stage)
         user = (
@@ -195,6 +195,11 @@ class LLM:
             f"Последняя переписка:\n{_dialog(recent) or 'нет'}\n"
             f"Ученик: {display}"
         )
+        if avoid:
+            user += (
+                f"\n\nПрошлый вариант затронул запрещённое: {'; '.join(avoid)}. "
+                f"Перепиши так, чтобы этого не было ни словом."
+            )
         out: PlainText = await self._parse(
             self.smart,
             PING_SYS.format(

@@ -132,6 +132,14 @@ class Repo:
         )
         return row["ts"] if row else None
 
+    async def last_in_ts(self, username):
+        row = await self._one(
+            "SELECT ts FROM messages WHERE username=? AND direction='in' "
+            "ORDER BY ts DESC LIMIT 1",
+            (username,),
+        )
+        return row["ts"] if row else None
+
     async def recent_messages(self, username, limit=15):
         rows = await self._all(
             "SELECT direction, text, ts FROM messages WHERE username=? ORDER BY ts DESC LIMIT ?",
@@ -331,3 +339,29 @@ class Repo:
         if os.path.exists(path):
             os.remove(path)
         await self._c.execute("VACUUM INTO ?", (path,))
+
+    # ping_drafts — пинги, ждущие решения ментора (режим review или провал проверки)
+    async def add_ping_draft(self, username, text, ts_iso) -> int:
+        cur = await self._c.execute(
+            "INSERT INTO ping_drafts(username, text, created_ts) VALUES (?,?,?)",
+            (username, text, ts_iso),
+        )
+        await self._c.commit()
+        return cur.lastrowid
+
+    async def get_ping_draft(self, pid):
+        return await self._one("SELECT * FROM ping_drafts WHERE id=?", (pid,))
+
+    async def open_ping_draft(self, username):
+        return await self._one(
+            "SELECT * FROM ping_drafts WHERE username=? AND state='open' ORDER BY id DESC LIMIT 1",
+            (username,),
+        )
+
+    async def set_ping_draft_state(self, pid, state):
+        await self._exec("UPDATE ping_drafts SET state=? WHERE id=?", (state, pid))
+
+    async def close_ping_drafts(self, username, state="stale"):
+        await self._exec(
+            "UPDATE ping_drafts SET state=? WHERE username=? AND state='open'", (state, username)
+        )

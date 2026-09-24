@@ -80,8 +80,9 @@ class Service:
         # ответ ментора своими словами — лучший пример для будущих черновиков
         await self.repo.record_manual_answer(username, text)
         await self.repo.close_open_questions(username)
-        # ментор ответил сам — накопленное обрабатывать не нужно
+        # ментор ответил сам — накопленное обрабатывать не нужно, ждущий пинг тоже
         await self.repo.drop_pending(username)
+        await self.repo.close_ping_drafts(username)
         try:
             await self._touch_sheet_date(username, ts_iso)
         except Exception:
@@ -111,6 +112,8 @@ class Service:
         except Exception:
             log.exception("sheet date update failed")
             await self.sender.notify_mentor(f"⚠️ Не смог обновить дату в таблице для @{username}")
+        # ученик вышел на связь — пинг, ждущий одобрения, больше не нужен
+        await self.repo.close_ping_drafts(username)
         # LLM здесь НЕ дёргаем: копим в буфер, обработает drain_pending
         await self.repo.buffer_incoming(username, text, ts_iso)
 

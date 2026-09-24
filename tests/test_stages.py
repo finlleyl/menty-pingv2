@@ -115,3 +115,20 @@ def test_mock_stage_asks_about_the_mock():
 def test_new_stages_have_labels():
     for stage in ("resume", "legend", "mock"):
         assert STAGE_LABELS[stage]
+
+
+def test_forbidden_hits_catches_leaks():
+    from mentor_bot.stages import forbidden_hits
+    assert forbidden_hits("Как спринт? И резюме уже думал обновить?", "sprint2") == ["резюме"]
+    assert forbidden_hits("Как отклики, есть движение по офферам?", "market") == []
+    assert forbidden_hits("Как там с домашкой по спринту?", "market") == [
+        "прохождение спринтов", "учебные задания",
+    ]
+
+
+def test_allowed_topics_never_trip_the_guard():
+    # то, о чём спрашивать МОЖНО, не должно само по себе считаться нарушением
+    from mentor_bot.stages import STAGE_LABELS, forbidden_hits, ping_topics
+    for stage in STAGE_LABELS:
+        allowed, _ = ping_topics(stage)
+        assert forbidden_hits("; ".join(allowed), stage) == [], stage

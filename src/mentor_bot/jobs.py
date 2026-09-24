@@ -5,8 +5,11 @@ import os
 import tempfile
 import logging
 import random
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from mentor_bot.llm import LLMUnavailable
 from mentor_bot.pings import (
@@ -15,7 +18,7 @@ from mentor_bot.pings import (
     parse_iso_utc,
     should_ping,
 )
-from mentor_bot.stages import parse_stage
+from mentor_bot.stages import STAGE_LABELS, forbidden_hits, parse_stage
 
 log = logging.getLogger(__name__)
 
@@ -78,13 +81,35 @@ async def ping_cycle(service, repo, sender, llm, settings, now_utc: datetime | N
                     await repo.set_setting("alerted_no_bconn", "1")
                 break  # без подключения дальше по циклу смысла нет
 
+        review = await repo.get_setting("ping_mode", "auto") == "review"
+        if await repo.open_ping_draft(username):
+            continue  # прошлый пинг ещё ждёт твоего решения — второй не готовим
+
+        stage = parse_stage(m.status)
         try:
             recent = await repo.recent_messages(username, limit=10)
             profile = await repo.get_profile(username)
             text = await llm.gen_ping(m.display, m.status, recent, profile, m.notes)
+            hits = forbidden_hits(text, stage)
+            if hits:
+                log.warning("ping for %s touched forbidden %s, regenerating", username, hits)
+                text = await llm.gen_ping(m.display, m.status, recent, profile, m.notes, avoid=hits)
+                hits = forbidden_hits(text, stage)
         except Exception:
             log.exception("ping generation failed for %s", username)
             errors += 1
+            continue
+
+        if review or hits:
+            # не отправляем сами: либо так настроено, либо модель дважды нарушила запрет
+            pid = await repo.add_ping_draft(username, text, now_utc.isoformat())
+            await repo.log_ping(username, now_utc.isoformat(), "review")
+            warn = (f"\n\n⚠️ Модель дважды затронула запрещённое для стадии: {', '.join(hits)}"
+                    if hits else "")
+            await sender.notify_mentor(
+                f"📨 Пинг для @{username} ({STAGE_LABELS[stage]}):\n{text}{warn}",
+                reply_markup=ping_draft_kb(pid),
+            )
             continue
 
         await repo.log_ping(username, now_utc.isoformat(), "attempt")
@@ -94,39 +119,90 @@ async def ping_cycle(service, repo, sender, llm, settings, now_utc: datetime | N
             log.exception("ping send failed for %s", username)
             errors += 1
             continue
-
-        if result in ("sent", "dry") and parse_stage(m.status) == "resume":
-            # мяч у ментора: ученику пинг, ментору напоминание, что резюме за ним
-            since = rec.get("status_since")
-            waiting = ""
-            if since:
-                waiting = f" — ждёт уже {(now_utc - parse_iso_utc(since)).days} дн."
-            await sender.notify_mentor(f"📝 @{username} ждёт от тебя резюме{waiting}")
-
+        await after_ping(result, username, m, text, service, repo, sender, settings, now_utc)
         if result == "sent":
-            await repo.log_ping(username, now_utc.isoformat(), "sent")
-            await repo.bump_unanswered(username)
-            await repo.set_setting("alerted_no_bconn", "")
-            rec2 = await repo.get_mentee(username) or {}
-            if rec2.get("unanswered_pings", 0) >= settings.max_unanswered_pings:
-                await sender.notify_mentor(
-                    f"🚨 @{username} игнорит {settings.max_unanswered_pings} пинга подряд — "
-                    f"дальше не пингую, разберись вручную"
-                )
-            try:
-                await service.sheets.set_date(m, now_utc.astimezone(tz).date())
-                m.last_date = now_utc.astimezone(tz).date()
-            except Exception:
-                log.exception("sheet date write failed after ping")
-                await sender.notify_mentor(f"⚠️ Пинг @{username} ушёл, но дата в таблице не записана")
-            await repo.log_message(username, "out", text, now_utc.isoformat())
             await asyncio.sleep(58)  # rate limit ≤1 пинг/мин
-        elif result == "dry":
-            await repo.log_ping(username, now_utc.isoformat(), "dry")
 
     if errors:
         await sender.notify_mentor(f"⚠️ Цикл пингов: {errors} ошибок, детали в логах")
 
+
+
+def ping_draft_kb(pid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Отправить", callback_data=f"p:send:{pid}"),
+        InlineKeyboardButton(text="✏️ Править", callback_data=f"p:edit:{pid}"),
+        InlineKeyboardButton(text="Пропустить", callback_data=f"p:skip:{pid}"),
+    ]])
+
+
+async def after_ping(result, username, m, text, service, repo, sender, settings, now_utc):
+    """Учёт после отправки пинга — общий для цикла и для одобренных черновиков."""
+    tz = ZoneInfo(settings.tz_name)
+    if result in ("sent", "dry") and parse_stage(m.status) == "resume":
+        # мяч у ментора: ученику пинг, ментору напоминание, что резюме за ним
+        since = (await repo.get_mentee(username) or {}).get("status_since")
+        waiting = ""
+        if since:
+            waiting = f" — ждёт уже {(now_utc - parse_iso_utc(since)).days} дн."
+        await sender.notify_mentor(f"📝 @{username} ждёт от тебя резюме{waiting}")
+
+    if result == "sent":
+        await repo.log_ping(username, now_utc.isoformat(), "sent")
+        await repo.bump_unanswered(username)
+        await repo.set_setting("alerted_no_bconn", "")
+        rec2 = await repo.get_mentee(username) or {}
+        if rec2.get("unanswered_pings", 0) >= settings.max_unanswered_pings:
+            await sender.notify_mentor(
+                f"🚨 @{username} игнорит {settings.max_unanswered_pings} пинга подряд — "
+                f"дальше не пингую, разберись вручную"
+            )
+        try:
+            await service.sheets.set_date(m, now_utc.astimezone(tz).date())
+            m.last_date = now_utc.astimezone(tz).date()
+        except Exception:
+            log.exception("sheet date write failed after ping")
+            await sender.notify_mentor(f"⚠️ Пинг @{username} ушёл, но дата в таблице не записана")
+        await repo.log_message(username, "out", text, now_utc.isoformat())
+    elif result == "dry":
+        await repo.log_ping(username, now_utc.isoformat(), "dry")
+
+
+@dataclass
+class DraftOutcome:
+    message: str
+    retry: bool = False   # True — черновик остался открытым, можно повторить
+
+
+async def send_ping_draft(pid, service, repo, sender, settings, text=None,
+                          now_utc: datetime | None = None) -> DraftOutcome:
+    """Отправка одобренного пинга: как есть (text=None) или в редакции ментора."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+    d = await repo.get_ping_draft(pid)
+    if not d or d["state"] != "open":
+        return DraftOutcome("Уже обработано")
+    username = d["username"]
+    last_in = await repo.last_in_ts(username)
+    if last_in and parse_iso_utc(last_in) > parse_iso_utc(d["created_ts"]):
+        # пока пинг лежал, ученик написал сам — «ты куда пропал?» теперь неуместно
+        await repo.set_ping_draft_state(pid, "stale")
+        return DraftOutcome(f"@{username} уже написал сам — пинг неактуален, не отправляю")
+    m = service.by_username.get(username)
+    if m is None:
+        await repo.set_ping_draft_state(pid, "stale")
+        return DraftOutcome(f"@{username} больше нет в таблице")
+    text = text or d["text"]
+    await repo.log_ping(username, now_utc.isoformat(), "attempt")
+    try:
+        result = await sender.send_to_mentee(username, text)
+    except Exception:
+        log.exception("ping draft send failed for %s", username)
+        return DraftOutcome("Ошибка отправки", retry=True)
+    if result not in ("sent", "dry"):
+        return DraftOutcome(f"Не отправлено: {result}", retry=True)
+    await repo.set_ping_draft_state(pid, result)
+    await after_ping(result, username, m, text, service, repo, sender, settings, now_utc)
+    return DraftOutcome(f"Пинг @{username} отправлен" if result == "sent" else "Dry-run: ушло тебе")
 
 
 async def drain_pending(service, repo, sender, settings, now_utc: datetime | None = None):
