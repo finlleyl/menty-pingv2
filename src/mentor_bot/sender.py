@@ -1,5 +1,7 @@
 import asyncio
 
+from aiogram.types import BufferedInputFile
+
 
 class Sender:
     def __init__(self, bot, repo, mentor_user_id: int):
@@ -14,7 +16,12 @@ class Sender:
         return await self.repo.get_setting("pause_all", "0") == "1"
 
     async def notify_mentor(self, text: str, reply_markup=None):
-        await self.bot.send_message(self.mentor_user_id, text, reply_markup=reply_markup)
+        return await self.bot.send_message(self.mentor_user_id, text, reply_markup=reply_markup)
+
+    async def send_file_to_mentor(self, data: bytes, filename: str, caption: str = ""):
+        await self.bot.send_document(
+            self.mentor_user_id, BufferedInputFile(data, filename=filename), caption=caption or None
+        )
 
     async def send_to_mentee(self, username: str, text: str) -> str:
         if await self.is_paused_all():

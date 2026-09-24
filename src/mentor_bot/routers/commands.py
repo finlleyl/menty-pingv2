@@ -49,6 +49,28 @@ async def status_text(service, repo, settings, now_utc: datetime) -> str:
     return "\n".join(lines)
 
 
+async def cost_text(args: str, repo, now_utc: datetime) -> str:
+    days = int(args.strip()) if args.strip().isdigit() else 30
+    rows = await repo.usage_summary((now_utc - timedelta(days=days)).isoformat())
+    if not rows:
+        return f"За {days} дн. запросов к модели не было"
+    lines = [f"LLM за {days} дн.:"]
+    total, unpriced = 0.0, 0
+    for r in rows:
+        cost = r["cost"]
+        total += cost or 0.0
+        unpriced += r["calls"] - r["priced"]
+        money = f"${cost:.3f}" if cost is not None else "цена н/д"
+        lines.append(
+            f"• {r['task']}: {r['calls']} выз., {r['prompt_tokens']}→{r['completion_tokens']} ток., {money}"
+        )
+    lines.append(f"Итого: ${total:.2f}")
+    if unpriced:
+        # провайдер не вернул цену (не OpenRouter) — токены есть, денег нет
+        lines.append(f"Без цены: {unpriced} выз.")
+    return "\n".join(lines)
+
+
 async def handle_pause(args: str, repo) -> str:
     m = re.match(r"@?(\w+)\s+(\d+)", args.strip())
     if not m:
@@ -73,7 +95,7 @@ async def handle_pause_all(repo, on: bool) -> str:
     return "Стоп-кран ВКЛ: ничего не шлю" if on else "Стоп-кран выключен"
 
 
-def make_router(service, repo, sender, settings, reindex_fn) -> Router:
+def make_router(service, repo, sender, settings, reindex_fn, backup_fn=None) -> Router:
     router = Router()
     router.message.filter(F.chat.type == "private", F.from_user.id == settings.mentor_user_id)
 
@@ -111,6 +133,20 @@ def make_router(service, repo, sender, settings, reindex_fn) -> Router:
         _bg_tasks.add(task)
         task.add_done_callback(_bg_tasks.discard)
         await message.answer("Запустил переиндексацию базы знаний, отпишусь по готовности")
+
+    @router.message(Command("cost"))
+    async def cmd_cost(message: Message):
+        await message.answer(await cost_text(args_of(message), repo, datetime.now(timezone.utc)))
+
+    @router.message(Command("backup"))
+    async def cmd_backup(message: Message):
+        if backup_fn is None:
+            await message.answer("Бэкап не настроен")
+            return
+        try:
+            await backup_fn()
+        except Exception as e:
+            await message.answer(f"⚠️ Бэкап упал: {e}")
 
     @router.message(Command("start", "help"))
     async def cmd_help(message: Message):

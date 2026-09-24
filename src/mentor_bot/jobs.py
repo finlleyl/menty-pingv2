@@ -1,5 +1,8 @@
 import asyncio
+import gzip
 import json
+import os
+import tempfile
 import logging
 import random
 from datetime import datetime, timedelta, timezone
@@ -210,3 +213,16 @@ async def dossier_cycle(service, repo, llm, sender, settings, now_utc: datetime 
             errors += 1
     if errors:
         await sender.notify_mentor(f"⚠️ Досье: {errors} ошибок, детали в логах")
+
+
+async def backup_db(repo, sender, now_utc: datetime | None = None):
+    """Снимок SQLite, сжатый gzip, — файлом ментору в личку бота."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "bot.db")
+        await repo.backup_to(path)
+        with open(path, "rb") as f:
+            data = gzip.compress(f.read())
+    name = f"mentor-bot-{now_utc:%Y%m%d-%H%M}.db.gz"
+    await sender.send_file_to_mentor(data, name, caption="💾 Бэкап базы бота")
+    return name

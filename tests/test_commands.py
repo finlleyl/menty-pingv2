@@ -74,3 +74,40 @@ def test_listing_truncates_with_counter():
     out = _listing(many)
     assert "@u29" in out and "@u30" not in out
     assert "и ещё 14" in out
+
+
+async def test_cost_text_groups_by_task(tmp_path):
+    from mentor_bot.routers.commands import cost_text
+    repo, svc = await make(tmp_path)
+    now = datetime(2026, 9, 20, 12, tzinfo=timezone.utc)
+    await repo.log_usage("2026-09-19T10:00:00+00:00", "draft", "smart", 1000, 200, 0.02)
+    await repo.log_usage("2026-09-19T11:00:00+00:00", "draft", "smart", 1000, 200, 0.03)
+    await repo.log_usage("2026-09-19T11:00:00+00:00", "classify", "fast", 100, 3, None)
+    await repo.log_usage("2026-07-01T11:00:00+00:00", "ping", "smart", 100, 3, 9.0)   # вне окна
+    out = await cost_text("", repo, now)
+    assert "draft: 2 выз., 2000→400 ток., $0.050" in out
+    assert "classify: 1 выз." in out and "цена н/д" in out
+    assert "Итого: $0.05" in out and "ping" not in out
+    await repo.close()
+
+
+async def test_backup_db_sends_gzipped_copy(tmp_path):
+    import gzip
+    import sqlite3
+    from mentor_bot.jobs import backup_db
+    repo, svc = await make(tmp_path)
+    await repo.set_setting("k", "v")
+    sent = []
+
+    class S:
+        async def send_file_to_mentor(self, data, filename, caption=""):
+            sent.append((data, filename))
+
+    name = await backup_db(repo, S(), now_utc=datetime(2026, 9, 20, 1, tzinfo=timezone.utc))
+    assert name == "mentor-bot-20260920-0100.db.gz"
+    restored = tmp_path / "restored.db"
+    restored.write_bytes(gzip.decompress(sent[0][0]))
+    conn = sqlite3.connect(restored)
+    assert conn.execute("SELECT value FROM settings WHERE key='k'").fetchone() == ("v",)
+    conn.close()
+    await repo.close()

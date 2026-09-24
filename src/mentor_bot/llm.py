@@ -1,10 +1,14 @@
+import logging
 import re
+from datetime import datetime, timezone
 from typing import Literal
 
 import openai
 from pydantic import BaseModel
 
 from mentor_bot.stages import STAGE_LABELS, parse_stage, ping_topics
+
+log = logging.getLogger(__name__)
 
 
 class Classification(BaseModel):
@@ -108,7 +112,10 @@ def _dialog(recent: list[dict]) -> str:
 
 
 class LLM:
-    def __init__(self, api_key, model_smart, model_fast, embed_model, client=None, base_url=None):
+    def __init__(self, api_key, model_smart, model_fast, embed_model, client=None, base_url=None,
+                 usage_sink=None):
+        # usage_sink(ts_iso, task, model, prompt_tokens, completion_tokens, cost) — учёт расходов
+        self._usage_sink = usage_sink
         if client is None:
             client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url or None)
         self._c = client
@@ -117,12 +124,27 @@ class LLM:
         self.embed_model = embed_model
         # OpenRouter раздаёт модель нескольким хостам, structured outputs умеют не все —
         # без этого запрос со схемой может уехать туда, где схему проигнорируют
+        # usage.include — OpenRouter возвращает в usage стоимость запроса в долларах
         self._route = (
-            {"provider": {"require_parameters": True}}
+            {"provider": {"require_parameters": True}, "usage": {"include": True}}
             if base_url and "openrouter.ai" in base_url else None
         )
 
-    async def _parse(self, model, system, user, schema):
+    async def _record(self, task, model, resp):
+        usage = getattr(resp, "usage", None)
+        if self._usage_sink is None or usage is None:
+            return
+        try:
+            await self._usage_sink(
+                datetime.now(timezone.utc).isoformat(), task, model,
+                getattr(usage, "prompt_tokens", 0) or 0,
+                getattr(usage, "completion_tokens", 0) or 0,
+                getattr(usage, "cost", None),
+            )
+        except Exception:
+            log.exception("usage accounting failed")   # учёт не должен ронять основной запрос
+
+    async def _parse(self, model, system, user, schema, task="other"):
         try:
             resp = await self._c.chat.completions.parse(
                 model=model,
@@ -134,20 +156,23 @@ class LLM:
             if _is_outage(e):
                 raise LLMUnavailable(str(e)) from e
             raise
+        await self._record(task, model, resp)
         return resp.choices[0].message.parsed
 
     async def classify(self, text: str) -> str:
-        out: Classification = await self._parse(self.fast, CLASSIFY_SYS, text, Classification)
+        out: Classification = await self._parse(self.fast, CLASSIFY_SYS, text, Classification, "classify")
         return out.kind
 
     async def parse_status(self, text: str, current_status: str | None) -> StatusUpdate:
         return await self._parse(
-            self.fast, STATUS_SYS.format(current=current_status or "нет"), text, StatusUpdate
+            self.fast, STATUS_SYS.format(current=current_status or "нет"), text, StatusUpdate,
+            "status",
         )
 
     async def parse_mentor_verdict(self, text: str, current_status: str | None) -> StatusUpdate:
         return await self._parse(
-            self.fast, VERDICT_SYS.format(current=current_status or "нет"), text, StatusUpdate
+            self.fast, VERDICT_SYS.format(current=current_status or "нет"), text, StatusUpdate,
+            "verdict",
         )
 
     async def gen_ping(self, display, status, recent, profile, notes=None) -> str:
@@ -168,13 +193,14 @@ class LLM:
             ),
             user,
             PlainText,
+            "ping",
         )
         return out.text
 
     async def draft_answer(self, question, chunks, profile) -> str:
         ctx = "\n\n---\n\n".join(chunks) or "(материалы не найдены)"
         user = f"Вопрос ученика: {question}\n\nДосье: {profile or 'нет'}\n\nМатериалы курса:\n{ctx}"
-        out: PlainText = await self._parse(self.smart, DRAFT_SYS, user, PlainText)
+        out: PlainText = await self._parse(self.smart, DRAFT_SYS, user, PlainText, "draft")
         return out.text
 
     async def update_profile(self, old, recent, notes=None) -> str:
@@ -183,7 +209,7 @@ class LLM:
             f"Пометки ментора: {notes or 'нет'}\n\n"
             f"Свежая переписка:\n{_dialog(recent)}"
         )
-        out: PlainText = await self._parse(self.fast, PROFILE_SYS, user, PlainText)
+        out: PlainText = await self._parse(self.fast, PROFILE_SYS, user, PlainText, "dossier")
         return out.text
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
@@ -193,4 +219,5 @@ class LLM:
             if _is_outage(e):
                 raise LLMUnavailable(str(e)) from e
             raise
+        await self._record("embed", self.embed_model, resp)
         return [d.embedding for d in resp.data]

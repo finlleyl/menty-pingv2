@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     max_unanswered_pings: int = 3
     debounce_minutes: int = 5
     dossier_hour: int = 3
+    backup_hour: int = 4          # -1 — ночной бэкап выключен
     stop_statuses: str = "умер,оффер,приостановил,договор,ушел,ушёл,на стопе"
     log_level: str = "INFO"
 

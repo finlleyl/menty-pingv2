@@ -279,3 +279,25 @@ class Repo:
         return await self._all(
             "SELECT * FROM pending WHERE last_in_ts < ? ORDER BY last_in_ts", (before_iso,)
         )
+
+    # llm_usage — учёт токенов и денег
+    async def log_usage(self, ts_iso, task, model, prompt_tokens, completion_tokens, cost):
+        await self._exec(
+            "INSERT INTO llm_usage(ts, task, model, prompt_tokens, completion_tokens, cost) "
+            "VALUES (?,?,?,?,?,?)",
+            (ts_iso, task, model, prompt_tokens, completion_tokens, cost),
+        )
+
+    async def usage_summary(self, since_iso):
+        return await self._all(
+            "SELECT task, COUNT(*) AS calls, SUM(prompt_tokens) AS prompt_tokens, "
+            "SUM(completion_tokens) AS completion_tokens, SUM(cost) AS cost, "
+            "COUNT(cost) AS priced FROM llm_usage WHERE ts >= ? GROUP BY task ORDER BY cost DESC, calls DESC",
+            (since_iso,),
+        )
+
+    async def backup_to(self, path: str):
+        """Консистентная копия базы через то же соединение (без гонки с записями)."""
+        if os.path.exists(path):
+            os.remove(path)
+        await self._c.execute("VACUUM INTO ?", (path,))
