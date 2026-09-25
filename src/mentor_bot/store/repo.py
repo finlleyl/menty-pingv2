@@ -1,9 +1,13 @@
 import json
 import os
+from datetime import timedelta
 
 import aiosqlite
 
 from .db import SCHEMA
+
+MIN_ANSWER_CHARS = 40       # короче — «ок, щас гляну», а не ответ
+ANSWER_WINDOW_HOURS = 6     # сколько после вопроса ждём настоящего ответа ментора
 
 
 class Repo:
@@ -23,10 +27,13 @@ class Repo:
     @staticmethod
     async def _migrate(conn):
         """Догоняем схему на базах, созданных прошлыми версиями."""
-        cur = await conn.execute("PRAGMA table_info(mentees)")
-        cols = {row[1] for row in await cur.fetchall()}
-        if "status_since" not in cols:
-            await conn.execute("ALTER TABLE mentees ADD COLUMN status_since TEXT")
+        for table, col in (
+            ("mentees", "status_since"), ("mentees", "last_status"),
+            ("proposals", "from_status"), ("questions", "final"), ("questions", "emb"),
+        ):
+            cur = await conn.execute(f"PRAGMA table_info({table})")
+            if col not in {row[1] for row in await cur.fetchall()}:
+                await conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
 
     async def close(self):
         await self._c.close()
@@ -62,6 +69,45 @@ class Repo:
         await self._exec("INSERT OR IGNORE INTO mentees(username) VALUES (?)", (username,))
         await self._exec("UPDATE mentees SET status_since=? WHERE username=?", (ts_iso, username))
 
+    async def record_status(self, username, status, ts_iso, source) -> bool:
+        """Фиксирует статус, увиденный в таблице (source='sheet') или подтверждённый кнопкой
+        (source='bot'). Смена пишется в status_history и сдвигает status_since.
+
+        Первое наблюдение из таблицы — не переход: когда ученик туда попал, неизвестно,
+        поэтому status_since не трогаем, а событие помечаем 'initial'.
+        True — был настоящий переход."""
+        from mentor_bot.stages import parse_stage
+        status = (status or "").strip()
+        await self._exec("INSERT OR IGNORE INTO mentees(username) VALUES (?)", (username,))
+        rec = await self.get_mentee(username)
+        prev = rec["last_status"]
+        if prev == status:
+            return False
+        if not status and prev:
+            return False  # ячейку на минуту очистили — это не смена стадии
+        initial = prev is None and source == "sheet"
+        await self._exec(
+            "INSERT INTO status_history(username, from_status, to_status, ts, source) "
+            "VALUES (?,?,?,?,?)",
+            (username, prev, status, ts_iso, "initial" if initial else source),
+        )
+        if initial or parse_stage(prev) == parse_stage(status):
+            # первое наблюдение или переименование («3 спринт» → «Спринт 3»): таймер стадии не сбрасываем
+            await self._exec("UPDATE mentees SET last_status=? WHERE username=?", (status, username))
+            return False
+        await self._exec(
+            "UPDATE mentees SET last_status=?, status_since=? WHERE username=?",
+            (status, ts_iso, username),
+        )
+        return True
+
+    async def status_history(self, username=None):
+        if username is None:
+            return await self._all("SELECT * FROM status_history ORDER BY username, ts, id")
+        return await self._all(
+            "SELECT * FROM status_history WHERE username=? ORDER BY ts, id", (username,)
+        )
+
     async def set_pause(self, username, until_iso):
         await self._exec("UPDATE mentees SET paused_until=? WHERE username=?", (until_iso, username))
 
@@ -94,6 +140,14 @@ class Repo:
         )
         return row["ts"] if row else None
 
+    async def last_in_ts(self, username):
+        row = await self._one(
+            "SELECT ts FROM messages WHERE username=? AND direction='in' "
+            "ORDER BY ts DESC LIMIT 1",
+            (username,),
+        )
+        return row["ts"] if row else None
+
     async def recent_messages(self, username, limit=15):
         rows = await self._all(
             "SELECT direction, text, ts FROM messages WHERE username=? ORDER BY ts DESC LIMIT ?",
@@ -114,10 +168,10 @@ class Repo:
         return row["ts"] if row else None
 
     # questions
-    async def add_question(self, username, question, draft, ts_iso) -> int:
+    async def add_question(self, username, question, draft, ts_iso, emb=None) -> int:
         cur = await self._c.execute(
-            "INSERT INTO questions(username, question, draft, created_ts) VALUES (?,?,?,?)",
-            (username, question, draft, ts_iso),
+            "INSERT INTO questions(username, question, draft, created_ts, emb) VALUES (?,?,?,?,?)",
+            (username, question, draft, ts_iso, json.dumps(emb) if emb is not None else None),
         )
         await self._c.commit()
         return cur.lastrowid
@@ -127,6 +181,43 @@ class Repo:
 
     async def set_question_state(self, qid, state):
         await self._exec("UPDATE questions SET state=? WHERE id=?", (state, qid))
+
+    async def set_question_final(self, qid, final):
+        """Что в итоге ушло ученику: черновик как есть или правка ментора."""
+        await self._exec("UPDATE questions SET final=? WHERE id=?", (final, qid))
+
+    async def record_manual_answer(self, username, text, now_utc):
+        """Ментор ответил в чате сам — это и есть ответ на вопрос.
+
+        Короткое «щас гляну» ответом не считаем: вопрос оно закроет (close_open_questions),
+        а настоящий ответ, пришедший следом в пределах окна, запишется уже в закрытый вопрос."""
+        if len(text.strip()) < MIN_ANSWER_CHARS:
+            return
+        since = (now_utc - timedelta(hours=ANSWER_WINDOW_HOURS)).isoformat()
+        await self._exec(
+            "UPDATE questions SET final=? WHERE username=? AND final IS NULL "
+            "AND state IN ('open', 'answered') AND created_ts >= ?",
+            (text, username, since),
+        )
+
+    async def edit_examples(self, limit=5):
+        """Последние случаи, когда ментор ответил не так, как предлагал черновик."""
+        return await self._all(
+            "SELECT question, draft, final FROM questions "
+            "WHERE final IS NOT NULL AND final != draft ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+
+    async def answered_questions(self, limit=500):
+        """Вопросы с настоящим ответом ментора и эмбеддингом вопроса — для поиска похожих."""
+        rows = await self._all(
+            "SELECT question, final, emb FROM questions "
+            "WHERE final IS NOT NULL AND emb IS NOT NULL ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+        for r in rows:
+            r["emb"] = json.loads(r["emb"])
+        return rows
 
     async def open_questions(self, older_than_iso=None, unreminded_only=False):
         sql = "SELECT * FROM questions WHERE state='open'"
@@ -147,9 +238,11 @@ class Repo:
         )
 
     # proposals
-    async def add_proposal(self, username, new_status) -> int:
+    async def add_proposal(self, username, new_status, from_status=None) -> int:
+        """from_status — статус на момент предложения; None — не сверять (старые записи)."""
         cur = await self._c.execute(
-            "INSERT INTO proposals(username, new_status) VALUES (?,?)", (username, new_status)
+            "INSERT INTO proposals(username, new_status, from_status) VALUES (?,?,?)",
+            (username, new_status, from_status),
         )
         await self._c.commit()
         return cur.lastrowid
@@ -239,3 +332,86 @@ class Repo:
         return await self._all(
             "SELECT * FROM pending WHERE last_in_ts < ? ORDER BY last_in_ts", (before_iso,)
         )
+
+    # llm_usage — учёт токенов и денег
+    async def log_usage(self, ts_iso, task, model, prompt_tokens, completion_tokens, cost):
+        await self._exec(
+            "INSERT INTO llm_usage(ts, task, model, prompt_tokens, completion_tokens, cost) "
+            "VALUES (?,?,?,?,?,?)",
+            (ts_iso, task, model, prompt_tokens, completion_tokens, cost),
+        )
+
+    async def usage_summary(self, since_iso):
+        return await self._all(
+            "SELECT task, COUNT(*) AS calls, SUM(prompt_tokens) AS prompt_tokens, "
+            "SUM(completion_tokens) AS completion_tokens, SUM(cost) AS cost, "
+            "COUNT(cost) AS priced FROM llm_usage WHERE ts >= ? GROUP BY task ORDER BY cost DESC, calls DESC",
+            (since_iso,),
+        )
+
+    async def backup_to(self, path: str):
+        """Консистентная копия базы через то же соединение (без гонки с записями)."""
+        if os.path.exists(path):
+            os.remove(path)
+        await self._c.commit()   # VACUUM INTO не работает внутри открытой транзакции
+        await self._c.execute("VACUUM INTO ?", (path,))
+
+    # ping_drafts — пинги, ждущие решения ментора (режим review или провал проверки)
+    async def add_ping_draft(self, username, text, ts_iso) -> int:
+        cur = await self._c.execute(
+            "INSERT INTO ping_drafts(username, text, created_ts) VALUES (?,?,?)",
+            (username, text, ts_iso),
+        )
+        await self._c.commit()
+        return cur.lastrowid
+
+    async def get_ping_draft(self, pid):
+        return await self._one("SELECT * FROM ping_drafts WHERE id=?", (pid,))
+
+    async def open_ping_draft(self, username):
+        return await self._one(
+            "SELECT * FROM ping_drafts WHERE username=? AND state='open' ORDER BY id DESC LIMIT 1",
+            (username,),
+        )
+
+    async def claim(self, table, rid, state="sending") -> bool:
+        """Атомарно забрать запись open → state. Два быстрых нажатия «Отправить» обрабатываются
+        конкурентно; отправит только тот, чей UPDATE реально сменил состояние."""
+        assert table in ("ping_drafts", "questions")
+        cur = await self._c.execute(
+            f"UPDATE {table} SET state=? WHERE id=? AND state='open'", (state, rid)
+        )
+        await self._c.commit()
+        return cur.rowcount == 1
+
+    async def set_ping_draft_state(self, pid, state):
+        await self._exec("UPDATE ping_drafts SET state=? WHERE id=?", (state, pid))
+
+    async def close_ping_drafts(self, username, state="stale"):
+        await self._exec(
+            "UPDATE ping_drafts SET state=? WHERE username=? AND state='open'", (state, username)
+        )
+
+    # interview_notes — вопросы с собесов, которые пересказал ученик
+    async def add_interview_notes(self, username, source_ts, items, embs):
+        for it, emb in zip(items, embs):
+            await self._c.execute(
+                "INSERT INTO interview_notes(username, source_ts, company, stage, question, failed, emb) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (username, source_ts, it.company, it.stage, it.question, int(it.failed),
+                 json.dumps(emb)),
+            )
+        await self._c.commit()
+
+    async def interview_questions(self, failed_only=True, since_iso=None):
+        sql = "SELECT * FROM interview_notes WHERE emb IS NOT NULL"
+        args: list = []
+        if failed_only:
+            sql += " AND failed=1"
+        if since_iso:
+            sql += " AND source_ts >= ?"
+            args.append(since_iso)
+        rows = await self._all(sql + " ORDER BY id", tuple(args))
+        for r in rows:
+            r["emb"] = json.loads(r["emb"])
+        return rows

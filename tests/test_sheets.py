@@ -1,3 +1,4 @@
+import pytest
 from datetime import date
 
 from mentor_bot.sheets import extract_username, map_headers, parse_date, parse_sheet
@@ -91,3 +92,75 @@ def test_next_free_col_ignores_trailing_empties():
     rows = [["Column 1", "Заметочки", "Дата пинга", "", ""]]
     assert next_free_col(rows, 0) == 3
     assert next_free_col(ROWS_REAL, 0) == 5
+
+
+class FakeCell:
+    def __init__(self, value):
+        self.value = value
+
+
+class FakeWorksheet:
+    """Лист в памяти: rows[i][j] ↔ ячейка (i+1, j+1)."""
+
+    def __init__(self, rows):
+        self.rows = [list(r) for r in rows]
+        self.writes = []
+
+    def col_values(self, col):
+        return [r[col - 1] if col - 1 < len(r) else "" for r in self.rows]
+
+    def cell(self, row, col):
+        return FakeCell(self.rows[row - 1][col - 1])
+
+    def update_cell(self, row, col, value):
+        self.writes.append((row, col, value))
+        self.rows[row - 1][col - 1] = value
+
+
+class FakeBook:
+    def __init__(self, ws):
+        self.ws = ws
+
+    def worksheet(self, title):
+        return self.ws
+
+
+def client_with(rows):
+    from mentor_bot.sheets import SheetsClient
+    c = SheetsClient("sa.json", "id", ["Лист1"])
+    ws = FakeWorksheet(rows)
+    c._book = FakeBook(ws)
+    return c, ws
+
+
+async def test_write_follows_row_after_sheet_resort():
+    c, ws = client_with(ROWS)
+    stepan = parse_sheet("Лист1", ROWS)[0]
+    assert stepan.row == 3
+    # ментор отсортировал лист: Олег поднялся, Степан уехал на строку ниже
+    ws.rows[2], ws.rows[3] = ws.rows[3], ws.rows[2]
+    await c.set_date(stepan, date(2026, 9, 1))
+    assert ws.writes == [(4, 4, "01/09/2026")]
+    assert stepan.row == 4
+    assert ws.rows[2][3] == ""   # строка Олега не тронута
+
+
+async def test_write_to_vanished_mentee_raises():
+    from mentor_bot.sheets import RowNotFound
+    c, ws = client_with(ROWS)
+    stepan = parse_sheet("Лист1", ROWS)[0]
+    ws.rows[2][2] = "кто-то другой"
+    with pytest.raises(RowNotFound):
+        await c.set_date(stepan, date(2026, 9, 1))
+    assert ws.writes == []
+
+
+async def test_set_status_compare_and_set():
+    from mentor_bot.sheets import StatusConflict
+    c, ws = client_with(ROWS)
+    stepan = parse_sheet("Лист1", ROWS)[0]
+    with pytest.raises(StatusConflict) as e:
+        await c.set_status(stepan, "Собесы", expected="Спринт 4")
+    assert e.value.current == "Работает" and ws.writes == []
+    await c.set_status(stepan, "Собесы", expected="Работает")
+    assert ws.writes == [(3, 5, "Собесы")]

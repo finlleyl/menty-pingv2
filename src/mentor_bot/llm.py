@@ -1,10 +1,14 @@
+import logging
 import re
+from datetime import datetime, timezone
 from typing import Literal
 
 import openai
 from pydantic import BaseModel
 
 from mentor_bot.stages import STAGE_LABELS, parse_stage, ping_topics
+
+log = logging.getLogger(__name__)
 
 
 class Classification(BaseModel):
@@ -18,6 +22,17 @@ class StatusUpdate(BaseModel):
 
 class PlainText(BaseModel):
     text: str
+
+
+class InterviewItem(BaseModel):
+    company: str | None
+    stage: str | None          # «HR», «техничка», «лайвкодинг», «финал» — как назвал ученик
+    question: str              # сам вопрос или задача, коротко
+    failed: bool               # ученик сказал, что не ответил, поплыл, срезался
+
+
+class InterviewReport(BaseModel):
+    items: list[InterviewItem]
 
 
 CLASSIFY_SYS = (
@@ -74,8 +89,13 @@ PING_SYS = (
 
 DRAFT_SYS = (
     "Ты готовишь ментору по Go-разработке ЧЕРНОВИК ответа на вопрос ученика. "
-    "Отвечай ТОЛЬКО на основе приложенных выдержек из материалов курса; если в материалах ответа нет — "
+    "Отвечай ТОЛЬКО на основе приложенных выдержек из материалов курса и прошлых ответов ментора "
+    "на похожие вопросы; если ответа нет ни там, ни там — "
     "так и напиши в черновике ('в материалах нет, ответь сам'). Стиль: неформальный, на «ты», по делу. "
+    "Если приложены примеры того, как ментор переписывал прошлые черновики, — пиши так, как он "
+    "в итоге отправлял: та же длина, тон, манера. "
+    "Если ответ взят из материалов, в конце одной строкой подскажи, где почитать подробнее, — "
+    "по пометкам «Источник» у выдержек (например: «подробнее — урок „Каналы“»). "
     "Верни только текст ответа."
 )
 
@@ -84,6 +104,26 @@ PROFILE_SYS = (
     "общения. Личные пометки ментора об ученике — самый достоверный источник: не противоречь им и не "
     "смягчай их. Старое досье, пометки ментора и свежая переписка ниже. Верни только текст досье."
 )
+
+
+INTERVIEW_SYS = (
+    "Ученик курса Go-разработки пишет ментору. Если он рассказывает о прошедшем собеседовании, "
+    "выпиши КАЖДЫЙ конкретный вопрос или задачу, которые ему задавали, отдельным пунктом, "
+    "коротко и по сути (например: «чем отличается буферизованный канал от небуферизованного»). "
+    "failed=true, если ученик говорит, что не ответил, запутался, завалил или срезался на этом. "
+    "company и stage — если названы, иначе null. Общие слова («было норм», «спрашивали про Go») "
+    "пунктами не считаются. Если рассказа о собеседовании нет — items=[]."
+)
+
+# Предфильтр: разбирать фидбэк моделью стоит, только если в тексте хоть что-то про собес
+_INTERVIEW_RE = re.compile(
+    r"собес|интервью|скрин|техничк|лайвкод|фидб[эе]к|спрашивал|спросил|задач[аиуе]|тимлид|\bhr\b",
+    re.IGNORECASE,
+)
+
+
+def looks_like_interview(text: str) -> bool:
+    return bool(_INTERVIEW_RE.search(text or ""))
 
 
 class LLMUnavailable(Exception):
@@ -103,12 +143,21 @@ def _is_outage(e: Exception) -> bool:
     return False
 
 
+def _chunk_text(c) -> str:
+    if isinstance(c, str):
+        return c
+    return f"[Источник: {c['source']}]\n{c['text']}" if c.get("source") else c["text"]
+
+
 def _dialog(recent: list[dict]) -> str:
     return "\n".join(f"{'Ученик' if m['direction'] == 'in' else 'Ментор'}: {m['text']}" for m in recent)
 
 
 class LLM:
-    def __init__(self, api_key, model_smart, model_fast, embed_model, client=None, base_url=None):
+    def __init__(self, api_key, model_smart, model_fast, embed_model, client=None, base_url=None,
+                 usage_sink=None):
+        # usage_sink(ts_iso, task, model, prompt_tokens, completion_tokens, cost) — учёт расходов
+        self._usage_sink = usage_sink
         if client is None:
             client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url or None)
         self._c = client
@@ -117,12 +166,27 @@ class LLM:
         self.embed_model = embed_model
         # OpenRouter раздаёт модель нескольким хостам, structured outputs умеют не все —
         # без этого запрос со схемой может уехать туда, где схему проигнорируют
+        # usage.include — OpenRouter возвращает в usage стоимость запроса в долларах
         self._route = (
-            {"provider": {"require_parameters": True}}
+            {"provider": {"require_parameters": True}, "usage": {"include": True}}
             if base_url and "openrouter.ai" in base_url else None
         )
 
-    async def _parse(self, model, system, user, schema):
+    async def _record(self, task, model, resp):
+        usage = getattr(resp, "usage", None)
+        if self._usage_sink is None or usage is None:
+            return
+        try:
+            await self._usage_sink(
+                datetime.now(timezone.utc).isoformat(), task, model,
+                getattr(usage, "prompt_tokens", 0) or 0,
+                getattr(usage, "completion_tokens", 0) or 0,
+                getattr(usage, "cost", None),
+            )
+        except Exception:
+            log.exception("usage accounting failed")   # учёт не должен ронять основной запрос
+
+    async def _parse(self, model, system, user, schema, task="other"):
         try:
             resp = await self._c.chat.completions.parse(
                 model=model,
@@ -134,23 +198,26 @@ class LLM:
             if _is_outage(e):
                 raise LLMUnavailable(str(e)) from e
             raise
+        await self._record(task, model, resp)
         return resp.choices[0].message.parsed
 
     async def classify(self, text: str) -> str:
-        out: Classification = await self._parse(self.fast, CLASSIFY_SYS, text, Classification)
+        out: Classification = await self._parse(self.fast, CLASSIFY_SYS, text, Classification, "classify")
         return out.kind
 
     async def parse_status(self, text: str, current_status: str | None) -> StatusUpdate:
         return await self._parse(
-            self.fast, STATUS_SYS.format(current=current_status or "нет"), text, StatusUpdate
+            self.fast, STATUS_SYS.format(current=current_status or "нет"), text, StatusUpdate,
+            "status",
         )
 
     async def parse_mentor_verdict(self, text: str, current_status: str | None) -> StatusUpdate:
         return await self._parse(
-            self.fast, VERDICT_SYS.format(current=current_status or "нет"), text, StatusUpdate
+            self.fast, VERDICT_SYS.format(current=current_status or "нет"), text, StatusUpdate,
+            "verdict",
         )
 
-    async def gen_ping(self, display, status, recent, profile, notes=None) -> str:
+    async def gen_ping(self, display, status, recent, profile, notes=None, avoid=None) -> str:
         stage = parse_stage(status)
         allowed, forbidden = ping_topics(stage)
         user = (
@@ -159,6 +226,11 @@ class LLM:
             f"Последняя переписка:\n{_dialog(recent) or 'нет'}\n"
             f"Ученик: {display}"
         )
+        if avoid:
+            user += (
+                f"\n\nПрошлый вариант затронул запрещённое: {'; '.join(avoid)}. "
+                f"Перепиши так, чтобы этого не было ни словом."
+            )
         out: PlainText = await self._parse(
             self.smart,
             PING_SYS.format(
@@ -168,13 +240,22 @@ class LLM:
             ),
             user,
             PlainText,
+            "ping",
         )
         return out.text
 
-    async def draft_answer(self, question, chunks, profile) -> str:
-        ctx = "\n\n---\n\n".join(chunks) or "(материалы не найдены)"
+    async def draft_answer(self, question, chunks, profile, examples=None, similar=None) -> str:
+        ctx = "\n\n---\n\n".join(_chunk_text(c) for c in chunks) or "(материалы не найдены)"
         user = f"Вопрос ученика: {question}\n\nДосье: {profile or 'нет'}\n\nМатериалы курса:\n{ctx}"
-        out: PlainText = await self._parse(self.smart, DRAFT_SYS, user, PlainText)
+        if similar:
+            user += "\n\nПохожие вопросы, на которые ментор уже отвечал сам:\n" + "\n\n".join(
+                f"Вопрос: {s['question'][:500]}\nОтвет ментора: {s['final'][:800]}" for s in similar
+            )
+        if examples:
+            user += "\n\nКак ментор переписывал прошлые черновики:\n" + "\n\n".join(
+                f"Черновик: {e['draft'][:500]}\nОтправил: {e['final'][:500]}" for e in examples
+            )
+        out: PlainText = await self._parse(self.smart, DRAFT_SYS, user, PlainText, "draft")
         return out.text
 
     async def update_profile(self, old, recent, notes=None) -> str:
@@ -183,8 +264,11 @@ class LLM:
             f"Пометки ментора: {notes or 'нет'}\n\n"
             f"Свежая переписка:\n{_dialog(recent)}"
         )
-        out: PlainText = await self._parse(self.fast, PROFILE_SYS, user, PlainText)
+        out: PlainText = await self._parse(self.fast, PROFILE_SYS, user, PlainText, "dossier")
         return out.text
+
+    async def extract_interview(self, text: str) -> InterviewReport:
+        return await self._parse(self.fast, INTERVIEW_SYS, text, InterviewReport, "interview")
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         try:
@@ -193,4 +277,5 @@ class LLM:
             if _is_outage(e):
                 raise LLMUnavailable(str(e)) from e
             raise
+        await self._record("embed", self.embed_model, resp)
         return [d.embedding for d in resp.data]

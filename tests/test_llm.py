@@ -140,7 +140,9 @@ async def test_openrouter_requires_hosts_that_support_the_schema():
     fake = FakeClient([Classification(kind="other")])
     llm = LLM("k", "smart", "fast", "emb", client=fake, base_url="https://openrouter.ai/api/v1")
     await llm.classify("спасибо")
-    assert fake.chat.completions.calls[0]["extra_body"] == {"provider": {"require_parameters": True}}
+    assert fake.chat.completions.calls[0]["extra_body"] == {
+        "provider": {"require_parameters": True}, "usage": {"include": True},
+    }
 
 
 async def test_direct_provider_gets_no_openrouter_routing():
@@ -169,3 +171,48 @@ async def test_provider_outage_becomes_llm_unavailable(exc):
 async def test_request_specific_errors_propagate_as_is(exc):
     with pytest.raises(type(exc)):
         await _raising_llm(exc).classify("спасибо")
+
+
+async def test_usage_is_recorded_per_task():
+    fake = FakeClient([Classification(kind="other")])
+    seen = []
+
+    async def sink(ts, task, model, pt, ct, cost):
+        seen.append((task, model, pt, ct, cost))
+
+    class Usage:
+        prompt_tokens, completion_tokens, cost = 120, 5, 0.0003
+
+    orig = fake.chat.completions.parse
+
+    async def parse_with_usage(**kw):
+        resp = await orig(**kw)
+        resp.usage = Usage()
+        return resp
+
+    fake.chat.completions.parse = parse_with_usage
+    llm = LLM("k", "smart", "fast", "emb", client=fake, usage_sink=sink)
+    await llm.classify("спасибо")
+    assert seen == [("classify", "fast", 120, 5, 0.0003)]
+
+
+async def test_broken_usage_sink_does_not_break_request():
+    fake = FakeClient([Classification(kind="question")])
+
+    async def sink(*a):
+        raise RuntimeError("db locked")
+
+    llm = LLM("k", "smart", "fast", "emb", client=fake, usage_sink=sink)
+
+    class Usage:
+        prompt_tokens, completion_tokens = 1, 1
+
+    orig = fake.chat.completions.parse
+
+    async def parse_with_usage(**kw):
+        resp = await orig(**kw)
+        resp.usage = Usage()
+        return resp
+
+    fake.chat.completions.parse = parse_with_usage
+    assert await llm.classify("а как?") == "question"

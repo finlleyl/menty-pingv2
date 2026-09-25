@@ -90,3 +90,51 @@ async def test_status_since_stamped_and_migrated(tmp_path):
     await repo.set_status_since("petr", "2026-08-27T10:00:00+00:00")   # ещё не заведён
     assert (await repo.get_mentee("petr"))["status_since"] == "2026-08-27T10:00:00+00:00"
     await repo.close()
+
+
+async def test_record_status_initial_then_transition(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    # первое наблюдение: когда ученик попал в статус — неизвестно, status_since не трогаем
+    assert await repo.record_status("ivan", "Спринт 1", "2026-08-01T10:00:00+00:00", "sheet") is False
+    assert (await repo.get_mentee("ivan"))["status_since"] is None
+    assert await repo.record_status("ivan", "Спринт 1", "2026-08-02T10:00:00+00:00", "sheet") is False
+    assert await repo.record_status("ivan", "Спринт 2", "2026-08-03T10:00:00+00:00", "sheet") is True
+    rec = await repo.get_mentee("ivan")
+    assert rec["status_since"] == "2026-08-03T10:00:00+00:00" and rec["last_status"] == "Спринт 2"
+    assert [h["source"] for h in await repo.status_history("ivan")] == ["initial", "sheet"]
+    await repo.close()
+
+
+async def test_proposal_keeps_from_status(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    pid = await repo.add_proposal("ivan", "Резюме", from_status="Спринт 4")
+    assert (await repo.get_proposal(pid))["from_status"] == "Спринт 4"
+    await repo.close()
+
+
+async def test_blank_cell_and_rename_do_not_reset_stage_timer(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    await repo.record_status("ivan", "Спринт 1", "2026-08-01T00:00:00+00:00", "sheet")
+    await repo.record_status("ivan", "Спринт 3", "2026-08-02T00:00:00+00:00", "sheet")
+    assert await repo.record_status("ivan", "", "2026-08-03T00:00:00+00:00", "sheet") is False
+    assert await repo.record_status("ivan", "3 спринт", "2026-08-04T00:00:00+00:00", "sheet") is False
+    rec = await repo.get_mentee("ivan")
+    assert rec["status_since"] == "2026-08-02T00:00:00+00:00" and rec["last_status"] == "3 спринт"
+    await repo.close()
+
+
+async def test_claim_is_single_winner(tmp_path):
+    import asyncio
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    pid = await repo.add_ping_draft("ivan", "т", "2026-08-01T00:00:00+00:00")
+    got = await asyncio.gather(repo.claim("ping_drafts", pid), repo.claim("ping_drafts", pid))
+    assert sorted(got) == [False, True]
+    await repo.close()
+
+
+async def test_backup_with_uncommitted_write(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    await repo._c.execute("INSERT INTO settings(key, value) VALUES ('x', '1')")   # без commit
+    await repo.backup_to(str(tmp_path / "copy.db"))
+    assert (tmp_path / "copy.db").exists()
+    await repo.close()

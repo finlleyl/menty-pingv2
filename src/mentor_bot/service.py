@@ -1,12 +1,18 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
+import numpy as np
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from mentor_bot.llm import looks_like_verdict
+from mentor_bot.llm import looks_like_interview, looks_like_verdict
+from mentor_bot.stages import parse_stage
 
 log = logging.getLogger(__name__)
+
+# Порог косинусной близости, с которого прошлый вопрос считаем «тем же самым».
+# Для text-embedding-3-small перефразировки одного вопроса обычно выше 0.7, разные темы — ниже.
+SIMILAR_MIN = 0.7
 
 
 def _kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
@@ -28,9 +34,25 @@ class Service:
     async def sync_mentees(self):
         mentees = await self.sheets.load_mentees()
         self.by_username = {m.username: m for m in mentees}
-        for m in mentees:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        # по by_username, а не по строкам: ник, записанный дважды, иначе «прыгал» бы
+        # между двумя статусами на каждой синхронизации и засорял историю
+        for m in self.by_username.values():
             await self.repo.upsert_mentee(m.username, sheet_title=m.sheet_title, row=m.row)
+            # ручные правки статуса в таблице тоже попадают в историю и сдвигают status_since
+            await self.repo.record_status(m.username, m.status, now_iso, "sheet")
         return self.by_username
+
+    async def _propose(self, username: str, m, new_status: str, text: str, prefix: str,
+                       hint: str = ""):
+        if (m.status or "").strip() == new_status.strip():
+            return  # статус уже такой — спрашивать нечего
+        pid = await self.repo.add_proposal(username, new_status, m.status or "")
+        await self.sender.notify_mentor(
+            f"📋 {prefix}: {text[:200]}\n"
+            f"Сменить статус «{m.status or '—'}» → «{new_status}»?{hint}",
+            reply_markup=_kb([[("Да", f"st:yes:{pid}"), ("Нет", f"st:no:{pid}")]]),
+        )
 
     async def _touch_sheet_date(self, username: str, ts_iso: str):
         m = self.by_username.get(username)
@@ -58,9 +80,12 @@ class Service:
     async def on_outgoing(self, username: str, text: str, ts_iso: str):
         await self.repo.log_message(username, "out", text, ts_iso)
         await self.repo.reset_unanswered(username)
+        # ответ ментора своими словами — лучший пример для будущих черновиков
+        await self.repo.record_manual_answer(username, text, datetime.fromisoformat(ts_iso))
         await self.repo.close_open_questions(username)
-        # ментор ответил сам — накопленное обрабатывать не нужно
+        # ментор ответил сам — накопленное обрабатывать не нужно, ждущий пинг тоже
         await self.repo.drop_pending(username)
+        await self.repo.close_ping_drafts(username)
         try:
             await self._touch_sheet_date(username, ts_iso)
         except Exception:
@@ -80,12 +105,7 @@ class Service:
         upd = await self.llm.parse_mentor_verdict(text, m.status)
         if not upd.new_status:
             return
-        pid = await self.repo.add_proposal(username, upd.new_status)
-        await self.sender.notify_mentor(
-            f"📋 Ты написал @{username}: {text[:200]}\n"
-            f"Сменить статус на «{upd.new_status}»?",
-            reply_markup=_kb([[("Да", f"st:yes:{pid}"), ("Нет", f"st:no:{pid}")]]),
-        )
+        await self._propose(username, m, upd.new_status, text, f"Ты написал @{username}")
 
     async def on_incoming(self, username: str, text: str, ts_iso: str):
         await self.repo.log_message(username, "in", text, ts_iso)
@@ -95,33 +115,67 @@ class Service:
         except Exception:
             log.exception("sheet date update failed")
             await self.sender.notify_mentor(f"⚠️ Не смог обновить дату в таблице для @{username}")
+        # ученик вышел на связь — пинг, ждущий одобрения, больше не нужен
+        await self.repo.close_ping_drafts(username)
         # LLM здесь НЕ дёргаем: копим в буфер, обработает drain_pending
         await self.repo.buffer_incoming(username, text, ts_iso)
 
     async def handle_buffered(self, username: str, text: str, ts_iso: str):
         """Разбор накопленного за окно дебаунса. Вызывается джобом drain_pending."""
-        kind = await self.llm.classify(text)
         m = self.by_username.get(username)
+        kind = await self.llm.classify(text)
         if kind == "question":
             emb = (await self.llm.embed([text]))[0]
             chunks = self.kb.search(text, emb, k=5)
             profile = await self.repo.get_profile(username)
-            draft = await self.llm.draft_answer(text, chunks, profile)
-            qid = await self.repo.add_question(username, text, draft, ts_iso)
+            similar = await self._similar_answers(emb)
+            examples = await self.repo.edit_examples(5)
+            draft = await self.llm.draft_answer(text, chunks, profile,
+                                                examples=examples, similar=similar)
+            qid = await self.repo.add_question(username, text, draft, ts_iso, emb=emb)
+            note = f"\n\n(учтено твоих прошлых ответов на похожее: {len(similar)})" if similar else ""
             await self.sender.notify_mentor(
-                f"❓ @{username} спрашивает:\n{text}\n\nЧЕРНОВИК:\n{draft}",
-                reply_markup=_kb([[("Отправить", f"q:send:{qid}"), ("Игнор", f"q:ign:{qid}")]]),
+                f"❓ @{username} спрашивает:\n{text}\n\nЧЕРНОВИК:\n{draft}{note}",
+                reply_markup=_kb([[("Отправить", f"q:send:{qid}"), ("✏️ Править", f"q:edit:{qid}"),
+                                   ("Игнор", f"q:ign:{qid}")]]),
             )
         elif kind == "progress":
             upd = await self.llm.parse_status(text, m.status if m else None)
             if upd.new_status and m is not None:
-                pid = await self.repo.add_proposal(username, upd.new_status)
                 hint = "уверенно" if upd.confidence == "high" else "под вопросом"
-                await self.sender.notify_mentor(
-                    f"📋 @{username} написал: {text[:200]}\n"
-                    f"Сменить статус на «{upd.new_status}»? ({hint})",
-                    reply_markup=_kb([[("Да", f"st:yes:{pid}"), ("Нет", f"st:no:{pid}")]]),
-                )
+                await self._propose(username, m, upd.new_status, text, f"@{username} написал",
+                                    f" ({hint})")
+        # фидбэк с собеса — последним и без права уронить разбор: основное уже сделано,
+        # и повтор буфера из-за этого шага продублировал бы черновики и предложения
+        if (m is not None and parse_stage(m.status) in ("interviews", "market")
+                and looks_like_interview(text)):
+            try:
+                await self._collect_interview(username, text, ts_iso)
+            except Exception:
+                log.exception("interview extraction failed for %s", username)
+    async def _collect_interview(self, username: str, text: str, ts_iso: str):
+        report = await self.llm.extract_interview(text)
+        if report is None or not report.items:
+            return
+        embs = await self.llm.embed([it.question for it in report.items])
+        await self.repo.add_interview_notes(username, ts_iso, report.items, embs)
+        failed = [it.question for it in report.items if it.failed]
+        lines = [f"🎯 @{username} про собес: записал вопросов — {len(report.items)}"]
+        if failed:
+            lines.append("Срезался на: " + "; ".join(q[:80] for q in failed[:5]))
+        await self.sender.notify_mentor("\n".join(lines))
+
+    async def _similar_answers(self, emb, k: int = 3):
+        """Прошлые вопросы, близкие по смыслу, вместе с тем, что ментор на них ответил."""
+        rows = await self.repo.answered_questions()
+        if not rows:
+            return []
+        mat = np.array([r["emb"] for r in rows], dtype=np.float32)
+        q = np.array(emb, dtype=np.float32)
+        sims = mat @ q / (np.linalg.norm(mat, axis=1) * (np.linalg.norm(q) or 1e-9) + 1e-9)
+        top = [i for i in np.argsort(-sims)[:k] if sims[i] >= SIMILAR_MIN]
+        return [rows[i] for i in top]
+
     async def on_unknown_chat(self, username: str, display: str):
         titles = self.settings.active_sheet_titles
         buttons = [[(t, f"add:{i}:{username}")] for i, t in enumerate(titles)]

@@ -23,7 +23,10 @@ class FakeSheets:
     async def set_date(self, m, d):
         self.dates.append((m.username, d))
 
-    async def set_status(self, m, s):
+    async def set_status(self, m, s, expected=None):
+        from mentor_bot.sheets import StatusConflict
+        if expected is not None and (m.status or "") != expected:
+            raise StatusConflict(m.status or "")
         self.statuses.append((m.username, s))
 
     async def append_mentee(self, title, display):
@@ -47,7 +50,8 @@ class FakeLLM:
     async def parse_mentor_verdict(self, text, current):
         return StatusUpdate(new_status=None, confidence="low")
 
-    async def draft_answer(self, q, chunks, profile):
+    async def draft_answer(self, q, chunks, profile, examples=None, similar=None):
+        self.draft_ctx = {"examples": examples, "similar": similar}
         return f"ЧЕРНОВИК[{q}]"
 
     async def update_profile(self, old, recent, notes=None):
@@ -70,7 +74,7 @@ class FakeSender:
 
 class FakeKB:
     def search(self, q, emb, k=5):
-        return ["из материалов"]
+        return [{"text": "из материалов", "source": "урок «Каналы»"}]
 
 
 class FakeSettings:
@@ -231,3 +235,135 @@ async def test_verdict_llm_failure_does_not_break_outgoing(tmp_path):
     await svc.on_outgoing("ivan", "сдан спринт 1", "2026-08-19T10:00:00+00:00")
     # сообщение всё равно залогировано, бот не упал
     assert (await repo.last_message_ts("ivan")) == "2026-08-19T10:00:00+00:00"
+
+
+async def test_manual_sheet_status_change_moves_status_since(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    sheets = FakeSheets([sm(status="Спринт 4")])
+    svc = Service(repo, sheets, FakeLLM(), FakeSender(), FakeKB(), FakeSettings())
+    await svc.sync_mentees()
+    await repo.set_status_since("ivan", "2026-06-01T10:00:00+00:00")   # старое подтверждение кнопкой
+    sheets.mentees[0].status = "Резюме"                                  # ментор поменял руками
+    await svc.sync_mentees()
+    rec = await repo.get_mentee("ivan")
+    assert rec["status_since"] > "2026-09-01"
+    await repo.close()
+
+
+async def test_no_proposal_when_status_unchanged(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    sender = FakeSender()
+    llm = FakeLLM(kind="progress", status=StatusUpdate(new_status="3 спринт", confidence="high"))
+    svc = Service(repo, FakeSheets([sm()]), llm, sender, FakeKB(), FakeSettings())
+    await svc.sync_mentees()
+    await svc.handle_buffered("ivan", "я всё ещё на третьем", "2026-08-19T10:00:00+00:00")
+    assert sender.mentor_msgs == []
+    await repo.close()
+
+
+async def test_manual_answer_is_remembered_and_reused_for_similar_question(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    llm = FakeLLM(kind="question")
+    sender = FakeSender()
+    svc = Service(repo, FakeSheets([sm()]), llm, sender, FakeKB(), FakeSettings())
+    await svc.sync_mentees()
+    # первый вопрос: черновик ментор не отправил, а ответил в чате сам
+    await svc.handle_buffered("ivan", "как закрыть канал?", "2026-08-19T10:00:00+00:00")
+    await svc.on_outgoing("ivan", "закрывает канал только отправитель, получатель читает до закрытия", "2026-08-19T10:05:00+00:00")
+    rows = await repo.answered_questions()
+    assert [r["final"] for r in rows] == ["закрывает канал только отправитель, получатель читает до закрытия"]
+    # похожий вопрос (FakeLLM.embed даёт тот же вектор) — прошлый ответ ушёл в контекст черновика
+    await svc.handle_buffered("ivan", "кто закрывает канал?", "2026-08-20T10:00:00+00:00")
+    assert [s["final"] for s in llm.draft_ctx["similar"]] == ["закрывает канал только отправитель, получатель читает до закрытия"]
+    assert "похожее: 1" in sender.mentor_msgs[-1][0]
+    await repo.close()
+
+
+async def test_dissimilar_answers_are_not_used(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    llm = FakeLLM(kind="question")
+    svc = Service(repo, FakeSheets([sm()]), llm, FakeSender(), FakeKB(), FakeSettings())
+    await svc.sync_mentees()
+    qid = await repo.add_question("ivan", "про мапы", "ч", "2026-08-19T10:00:00+00:00", emb=[0.0, 1.0])
+    await repo.set_question_final(qid, "ответ про мапы")
+    await svc.handle_buffered("ivan", "про каналы", "2026-08-20T10:00:00+00:00")   # эмбеддинг [1, 0]
+    assert llm.draft_ctx["similar"] == []
+    await repo.close()
+
+
+class InterviewLLM(FakeLLM):
+    def __init__(self):
+        super().__init__(kind="other")
+        self.extract_calls = 0
+
+    async def extract_interview(self, text):
+        from mentor_bot.llm import InterviewItem, InterviewReport
+        self.extract_calls += 1
+        return InterviewReport(items=[
+            InterviewItem(company="Ozon", stage="техничка", question="как устроен map", failed=True),
+            InterviewItem(company="Ozon", stage="техничка", question="что такое горутина", failed=False),
+        ])
+
+    async def embed(self, texts):
+        return [[1.0, 0.0] for _ in texts]
+
+
+async def test_interview_feedback_is_collected(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    llm, sender = InterviewLLM(), FakeSender()
+    svc = Service(repo, FakeSheets([sm(status="Собесы")]), llm, sender, FakeKB(), FakeSettings())
+    await svc.sync_mentees()
+    await svc.handle_buffered("ivan", "был на техничке в Ozon, спросили про map — поплыл",
+                              "2026-08-19T10:00:00+00:00")
+    assert [r["question"] for r in await repo.interview_questions()] == ["как устроен map"]
+    assert "Срезался на: как устроен map" in sender.mentor_msgs[-1][0]
+    await repo.close()
+
+
+async def test_broken_interview_extraction_does_not_lose_the_question(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    llm, sender = InterviewLLM(), FakeSender()
+    llm.kind = "question"
+
+    async def boom(text):
+        raise ValueError("refusal")
+
+    llm.extract_interview = boom
+    svc = Service(repo, FakeSheets([sm(status="Собесы")]), llm, sender, FakeKB(), FakeSettings())
+    await svc.sync_mentees()
+    await svc.handle_buffered("ivan", "был собес. Как работают каналы?", "2026-08-19T10:00:00+00:00")
+    assert len(await repo.open_questions()) == 1          # черновик на вопрос всё равно создан
+    await repo.close()
+
+
+async def test_duplicate_username_does_not_flap_status(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    sheets = FakeSheets([sm(status="Спринт 2"), sm(status="оффер")])   # один ник в двух строках
+    svc = Service(repo, sheets, FakeLLM(), FakeSender(), FakeKB(), FakeSettings())
+    for _ in range(3):
+        await svc.sync_mentees()
+    assert len(await repo.status_history("ivan")) == 1
+    await repo.close()
+
+
+async def test_short_holding_reply_is_not_the_answer(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    svc = Service(repo, FakeSheets([sm()]), FakeLLM(kind="question"), FakeSender(), FakeKB(),
+                  FakeSettings())
+    await svc.sync_mentees()
+    await svc.handle_buffered("ivan", "как закрыть канал?", "2026-08-19T10:00:00+00:00")
+    await svc.on_outgoing("ivan", "щас гляну", "2026-08-19T10:01:00+00:00")
+    real = "закрывает канал только отправитель, получатель читает до закрытия"
+    await svc.on_outgoing("ivan", real, "2026-08-19T10:20:00+00:00")
+    assert [r["final"] for r in await repo.answered_questions()] == [real]
+    await repo.close()
+
+
+async def test_interview_extraction_skipped_on_sprint_stage(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    llm = InterviewLLM()
+    svc = Service(repo, FakeSheets([sm(status="Спринт 2")]), llm, FakeSender(), FakeKB(), FakeSettings())
+    await svc.sync_mentees()
+    await svc.handle_buffered("ivan", "в задаче спринта спросил бы про map", "2026-08-19T10:00:00+00:00")
+    assert llm.extract_calls == 0
+    await repo.close()

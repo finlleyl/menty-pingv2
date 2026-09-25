@@ -12,6 +12,7 @@ dependencies = [
     "beautifulsoup4>=4.12",
     "markdownify>=0.13",
     "rank-bm25>=0.2.2",
+    "snowballstemmer>=2.2",
     "numpy>=1.26",
     "pydantic-settings>=2.4",
     "tzdata",
