@@ -132,3 +132,39 @@ def test_allowed_topics_never_trip_the_guard():
     for stage in STAGE_LABELS:
         allowed, _ = ping_topics(stage)
         assert forbidden_hits("; ".join(allowed), stage) == [], stage
+
+
+def test_sprint_topics_offer_text_help_not_calls():
+    from mentor_bot.style import call_hits
+    for stage in ("sprint1", "sprint2", "sprint3", "sprint4"):
+        allowed, _ = ping_topics(stage)
+        assert not any("созвон" in a for a in allowed)
+        assert call_hits("; ".join(allowed)) == []
+        assert any("помощь" in a for a in allowed)
+
+
+def test_calls_forbidden_everywhere_except_mock():
+    for stage in STAGE_LABELS:
+        _, forbidden = ping_topics(stage)
+        assert ("созвоны" in forbidden) == (stage != "mock"), stage
+
+
+def test_forbidden_hits_catches_call_offer_in_ping():
+    from mentor_bot.stages import forbidden_hits
+    assert forbidden_hits("Как спринт? Может, созвонимся и разберём?", "sprint2") == ["созвоны"]
+    assert forbidden_hits("Где застрял? Давай в зум на полчаса", "unknown") == ["созвоны"]
+    # мок — это и есть созвон по регламенту
+    assert forbidden_hits("Когда удобно созвониться на мок-собес?", "mock") == []
+
+
+def test_call_permission_follows_the_regulation():
+    from mentor_bot.stages import call_permission
+    assert call_permission("sprint_finished", "sprint2") == "sprint"
+    assert call_permission("sprint_finished", "unknown") == "sprint"   # статус в таблице пуст
+    assert call_permission("legend_ready", "legend") == "mock"
+    assert call_permission("none", "mock") == "mock"                    # легенда уже готова
+    assert call_permission("none", "sprint3") is None                   # застрял — не повод
+    assert call_permission("none", "market") is None
+    # разметка модели сверяется со стадией: на рынке спринты не сдают
+    assert call_permission("sprint_finished", "market") is None
+    assert call_permission("legend_ready", "offer") is None

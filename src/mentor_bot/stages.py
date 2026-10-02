@@ -1,5 +1,7 @@
 import re
 
+from mentor_bot.style import CALL_PATTERN
+
 # «Спринт 3», «3 спринт», «Спринт3» — в листе встречаются все варианты
 _SPRINT_RE = re.compile(r"спринт\s*([1-9])|([1-9])\s*спринт", re.IGNORECASE)
 
@@ -46,8 +48,9 @@ def parse_stage(status: str | None) -> str:
 
 
 # Спринт — это учёба, все четыре. Резюме, легенда и HR начинаются только после них.
+# Застрял — помогаем текстом: созвон по регламенту только собеседование по итогам спринта
 _SPRINT_TOPICS = (
-    ["как идёт спринт", "на какой теме сейчас", "где застрял", "нужен ли созвон"],
+    ["как идёт спринт", "на какой теме сейчас", "где застрял", "нужна ли помощь с темой"],
     ["собеседования", "рынок труда", "офферы", "отклики", "резюме", "легенда",
      "общение с HR"],
 )
@@ -92,9 +95,35 @@ _TOPICS = {
 }
 
 
+# Регламент ментора: созвон — только собеседование по итогам спринтов 1–4 и мок по легенде.
+# Пинг про молчание ни то, ни другое не назначает, поэтому «созвоны» запрещены везде,
+# кроме стадии «Мок»: там вопрос «когда удобно провести мок-собес» и есть суть пинга.
+CALLS_TOPIC = "созвоны"
+
+
 def ping_topics(stage: str) -> tuple[list[str], list[str]]:
     """Стадия → (о чём спрашивать можно, о чём спрашивать нельзя)."""
-    return _TOPICS.get(stage, _TOPICS["unknown"])
+    allowed, forbidden = _TOPICS.get(stage, _TOPICS["unknown"])
+    if stage != "mock":
+        forbidden = forbidden + [CALLS_TOPIC]
+    return allowed, forbidden
+
+
+SPRINTS = ("sprint1", "sprint2", "sprint3", "sprint4")
+
+
+def call_permission(milestone: str, stage: str) -> str | None:
+    """Можно ли в ЭТОМ ответе предложить созвон: "sprint" — собеседование по спринту,
+    "mock" — мок-собес по легенде, None — нельзя.
+
+    Метку milestone ставит модель, поэтому сверяем её со стадией из таблицы: «сдал спринт»
+    от ученика на рынке — ошибка разметки, а не повод назначать созвон."""
+    if stage == "mock" or (milestone == "legend_ready"
+                           and stage not in ("interviews", "market", "offer")):
+        return "mock"
+    if milestone == "sprint_finished" and stage in SPRINTS + ("unknown", "paused"):
+        return "sprint"
+    return None
 
 
 # Запрет тем держится не только на промпте: модель его иногда нарушает, а пинг уходит
@@ -111,6 +140,7 @@ _FORBIDDEN_RE = {
     "прохождение спринтов": r"спринт",
     "учебные задания": r"задани|домашк|\bдз\b",
     "поиск работы": r"поиск\w* работ|ваканси",
+    CALLS_TOPIC: CALL_PATTERN,
 }
 
 
