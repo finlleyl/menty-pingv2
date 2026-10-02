@@ -274,10 +274,10 @@ async def test_manual_sheet_status_change_moves_status_since(tmp_path):
 async def test_no_proposal_when_status_unchanged(tmp_path):
     repo = await Repo.open(str(tmp_path / "t.db"))
     sender = FakeSender()
-    llm = FakeLLM(kind="progress", status=StatusUpdate(new_status="3 спринт", confidence="high"))
-    svc = Service(repo, FakeSheets([sm()]), llm, sender, FakeKB(), FakeSettings())
+    llm = FakeLLM(kind="progress", status=StatusUpdate(new_status="Собесы", confidence="high"))
+    svc = Service(repo, FakeSheets([sm(status="Собесы")]), llm, sender, FakeKB(), FakeSettings())
     await svc.sync_mentees()
-    await svc.handle_buffered("ivan", "я всё ещё на третьем", "2026-08-19T10:00:00+00:00")
+    await svc.handle_buffered("ivan", "собесы идут потихоньку", "2026-08-19T10:00:00+00:00")
     assert sender.mentor_msgs == []
     await repo.close()
 
@@ -436,7 +436,9 @@ async def test_mixed_feelings_and_question_answers_both(tmp_path):
     assert sender.mentor_msgs[0][0].startswith("💬 @ivan делится и спрашивает:")
 
 
-async def test_win_with_status_change_gives_draft_and_proposal(tmp_path):
+async def test_sprint_finished_gives_sprint_interview_draft_but_no_status_proposal(tmp_path):
+    # модель зря поставила смену этапа и предложила «Спринт 4» — спринт сдан только после
+    # собеседования, статус двигает вердикт ментора, а не слова ученика
     repo, sender, kb, llm, svc = await make_triaged(
         tmp_path, kinds=["win", "status_change"], milestone="sprint_finished",
         status=StatusUpdate(new_status="Спринт 4", confidence="high"),
@@ -446,10 +448,9 @@ async def test_win_with_status_change_gives_draft_and_proposal(tmp_path):
     assert kb.calls == []
     assert llm.draft_calls[0]["call"] == "sprint"
     assert len(llm.draft_calls) == 1                          # созвон по регламенту — не переписываем
-    texts = [t for t, _ in sender.mentor_msgs]
-    assert texts[0].startswith("🎉 @ivan:") and "⚠️" not in texts[0]
-    assert "Сменить статус «3 спринт» → «Спринт 4»" in texts[1]
-    assert (await repo.get_proposal(1))["new_status"] == "Спринт 4"
+    [(text, _)] = sender.mentor_msgs
+    assert text.startswith("🎉 @ivan:") and "⚠️" not in text
+    assert await repo.get_proposal(1) is None
 
 
 async def test_smalltalk_produces_nothing(tmp_path):
@@ -552,7 +553,7 @@ async def test_milestone_labelled_only_as_status_change_still_gets_a_draft(tmp_p
     await svc.handle_buffered("ivan", "третий спринт всё", TS)
     assert llm.draft_calls[0]["call"] == "sprint" and "win" in llm.draft_calls[0]["kinds"]
     assert sender.mentor_msgs[0][0].startswith("🎉 @ivan:")
-    assert (await repo.get_proposal(1))["new_status"] == "Спринт 4"
+    assert await repo.get_proposal(1) is None                # этап двигает только вердикт ментора
 
 
 async def test_win_with_question_header(tmp_path):
@@ -573,8 +574,7 @@ async def test_mentor_marker_in_draft_is_highlighted(tmp_path):
 
 async def test_long_mentee_text_is_cut_to_fit_telegram(tmp_path):
     repo, sender, kb, llm, svc = await make_triaged(
-        tmp_path, kinds=["win", "status_change"], milestone="sprint_finished",
-        status=StatusUpdate(new_status="Спринт 4", confidence="high"),
+        tmp_path, kinds=["win"], milestone="sprint_finished",
         drafts=["Красава! " + "Глянул код. " * 100],
     )
     text = "сдал третий спринт! вот мой код\n" + "x := <-ch\n" * 300
@@ -583,7 +583,6 @@ async def test_long_mentee_text_is_cut_to_fit_telegram(tmp_path):
     assert len(shown) <= 4096 and "…" in shown and "Глянул код. " * 100 in shown
     [q] = await repo.open_questions()
     assert q["question"] == text                     # в базе — полный текст
-    assert (await repo.get_proposal(1))["new_status"] == "Спринт 4"
 
 
 class DraftRejectingSender(FakeSender):
@@ -596,27 +595,39 @@ class DraftRejectingSender(FakeSender):
 async def test_rejected_draft_does_not_cancel_status_proposal(tmp_path):
     repo = await Repo.open(str(tmp_path / "t.db"))
     sender = DraftRejectingSender()
-    llm = FakeLLM(kinds=["win", "status_change"], milestone="sprint_finished",
-                  status=StatusUpdate(new_status="Спринт 4", confidence="high"))
+    llm = FakeLLM(kinds=["feelings", "status_change"],
+                  status=StatusUpdate(new_status="приостановил", confidence="high"))
     svc = Service(repo, FakeSheets([sm()]), llm, sender, FakeKB(), FakeSettings())
     await svc.sync_mentees()
     with pytest.raises(RuntimeError):
-        await svc.handle_buffered("ivan", "сдал третий спринт!", TS)
+        await svc.handle_buffered("ivan", "на работе завал, беру паузу на месяц", TS)
     # ментор черновик не видел — открытым он не висит и remind_cycle о нём не напомнит
     assert await repo.open_questions() == []
-    assert (await repo.get_proposal(1))["new_status"] == "Спринт 4"
+    assert (await repo.get_proposal(1))["new_status"] == "приостановил"
     assert "Сменить статус" in sender.mentor_msgs[0][0]
     await repo.close()
 
 
-async def test_milestone_alone_still_proposes_status(tmp_path):
-    # модель забыла status_change при «сдал спринт» — предложение статуса всё равно придёт
+@pytest.mark.parametrize("new_status", ["Спринт 4", "Резюме", "Легенда", "Мок", "Рынок"])
+async def test_mentee_words_never_move_learning_stages(tmp_path, new_status):
+    # этапы учёбы двигает только вердикт ментора («сдан спринт 3»), даже если модель
+    # по словам ученика уверенно предложила следующий
     repo, sender, kb, llm, svc = await make_triaged(
-        tmp_path, kinds=["win"], milestone="sprint_finished",
-        status=StatusUpdate(new_status="Спринт 4", confidence="high"),
+        tmp_path, kinds=["status_change"], needs_reply=False,
+        status=StatusUpdate(new_status=new_status, confidence="high"),
     )
-    await svc.handle_buffered("ivan", "сдал третий!", TS)
-    assert (await repo.get_proposal(1))["new_status"] == "Спринт 4"
+    await svc.handle_buffered("ivan", "всё, закончил", TS)
+    assert await repo.get_proposal(1) is None and sender.mentor_msgs == []
+
+
+@pytest.mark.parametrize("new_status", ["Собесы", "оффер", "приостановил", "занят"])
+async def test_mentee_words_propose_what_the_mentee_decides(tmp_path, new_status):
+    repo, sender, kb, llm, svc = await make_triaged(
+        tmp_path, kinds=["status_change"], needs_reply=False,
+        status=StatusUpdate(new_status=new_status, confidence="high"),
+    )
+    await svc.handle_buffered("ivan", "новости", TS)
+    assert (await repo.get_proposal(1))["new_status"] == new_status
 
 
 async def test_draft_sees_dialog_notes_stage_and_mentor_style(tmp_path):

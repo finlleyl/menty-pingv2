@@ -9,7 +9,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from mentor_bot.llm import looks_like_interview, looks_like_verdict
 from mentor_bot.pings import parse_iso_utc
-from mentor_bot.stages import STAGE_LABELS, call_permission, parse_stage
+from mentor_bot.stages import STAGE_LABELS, call_permission, mentee_may_propose, parse_stage
 from mentor_bot.store.repo import KIND_HUMAN, KIND_QUESTION
 from mentor_bot.style import TECH_KINDS, draft_problems, normalize_dashes, todo_marks
 
@@ -64,11 +64,9 @@ def _ongoing(prior: list[dict], text: str, ts_iso: str) -> bool:
 def _kinds(tri) -> list[str]:
     """Метки сортировщика, поправленные кодом там, где ошибка дорога."""
     kinds = list(dict.fromkeys(tri.kinds)) or ["smalltalk"]
-    # сдал спринт / легенда готова — это и смена этапа; решает всё равно ментор кнопкой
-    if tri.milestone != "none" and "status_change" not in kinds:
-        kinds.append("status_change")
-    # и это успех: ровно здесь регламент разрешает позвать на собес по спринту или мок,
-    # поэтому черновик нужен, даже если модель поставила одну смену этапа
+    # сдал спринт / легенда готова — успех: ровно здесь регламент разрешает позвать на собес
+    # по спринту или мок, поэтому черновик нужен, даже если модель поставила одну смену этапа.
+    # Статус по этим словам не предлагаем: этапы учёбы двигает только вердикт ментора
     if tri.milestone != "none" and not any(k in REPLY_KINDS for k in kinds):
         kinds.append("win")
     # человеку плохо — черновик нужен, даже если модель не поставила «переживания»
@@ -209,6 +207,11 @@ class Service:
         upd = None
         if "status_change" in kinds and m is not None:
             upd = await self.llm.parse_status(text, status)
+            # страховка к промпту: «закончил спринт» — повод для собеса, а не для кнопки статуса
+            if upd.new_status and not mentee_may_propose(upd.new_status):
+                log.info("status %r from %s's words skipped: learning stages move by verdict only",
+                         upd.new_status, username)
+                upd = None
         draft = None
         wants_reply = tri.needs_reply or tri.urgent or tri.milestone != "none"
         if wants_reply and any(k in REPLY_KINDS for k in kinds):
@@ -217,8 +220,8 @@ class Service:
             if draft is not None:
                 await self._deliver_draft(username, status, text, ts_iso, kinds, tri.urgent, draft)
         finally:
-            # Telegram отверг черновик — предложение статуса всё равно нужно: раньше
-            # «сдал спринт» гарантированно давал кнопки, и сбой в соседнем шаге их не отменяет
+            # Telegram отверг черновик — предложение статуса («беру паузу») всё равно нужно:
+            # сбой в соседнем шаге его не отменяет
             if upd is not None and upd.new_status:
                 hint = "уверенно" if upd.confidence == "high" else "под вопросом"
                 await self._propose(username, m, upd.new_status, text, f"@{username} написал",

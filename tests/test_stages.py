@@ -171,3 +171,12 @@ def test_call_permission_follows_the_regulation():
     # разметка модели сверяется со стадией: на рынке спринты не сдают
     assert call_permission("sprint_finished", "market") is None
     assert call_permission("legend_ready", "offer") is None
+
+
+def test_mentee_may_propose_only_what_the_mentee_decides():
+    from mentor_bot.stages import mentee_may_propose
+    # этапы учёбы двигает только вердикт ментора: спринт сдан после его собеседования
+    for status in ("Спринт 2", "4 спринт", "Резюме", "Легенда", "Мок", "Рынок", "", None, "умер"):
+        assert not mentee_may_propose(status), status
+    for status in ("Собесы", "оффер", "приостановил", "занят"):
+        assert mentee_may_propose(status), status

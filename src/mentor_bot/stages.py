@@ -111,6 +111,16 @@ def ping_topics(stage: str) -> tuple[list[str], list[str]]:
 
 SPRINTS = ("sprint1", "sprint2", "sprint3", "sprint4")
 
+# Этапы учёбы (спринты, резюме, легенда, мок, рынок) двигает только вердикт ментора: спринт
+# сдан после его собеседования, а не когда ученик «закончил». По словам ученика бот предлагает
+# лишь то, что тот решает сам: вышел на собесы, получил оффер, берёт паузу или занят
+MENTEE_STAGES = ("interviews", "offer", "paused")
+
+
+def mentee_may_propose(status: str | None) -> bool:
+    """Можно ли предложить этот статус по словам ученика, а не по вердикту ментора."""
+    return parse_stage(status) in MENTEE_STAGES
+
 
 def call_permission(milestone: str, stage: str) -> str | None:
     """Можно ли в ЭТОМ ответе предложить созвон: "sprint" — собеседование по спринту,

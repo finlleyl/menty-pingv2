@@ -312,3 +312,12 @@ async def test_broken_usage_sink_does_not_break_request():
 
     fake.chat.completions.parse = parse_with_usage
     assert (await llm.triage("а как?")).kinds == ["tech_question"]
+
+
+def test_status_prompt_leaves_learning_stages_to_the_mentor():
+    from mentor_bot.llm import STATUS_SYS, TRIAGE_SYS
+    for status in ("«Собесы»", "«оффер»", "«приостановил»", "«занят»"):
+        assert status in STATUS_SYS
+    assert "двигает только ментор" in STATUS_SYS
+    assert "закончил/сдал спринт" in STATUS_SYS
+    assert "НЕ status_change" in TRIAGE_SYS
