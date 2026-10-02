@@ -1,6 +1,5 @@
 import asyncio
 import gzip
-import json
 import os
 import tempfile
 import logging
@@ -20,7 +19,7 @@ from mentor_bot.pings import (
     should_ping,
 )
 from mentor_bot.stages import STAGE_LABELS, forbidden_hits, parse_stage
-from mentor_bot.store.repo import KIND_HUMAN
+from mentor_bot.store.repo import KIND_HUMAN, SRC_BOT, SRC_BOT_EDIT
 from mentor_bot.style import ai_tells, normalize_dashes
 
 log = logging.getLogger(__name__)
@@ -148,8 +147,10 @@ def ping_draft_kb(pid: int) -> InlineKeyboardMarkup:
     ]])
 
 
-async def after_ping(result, username, m, text, service, repo, sender, settings, now_utc):
-    """Учёт после отправки пинга — общий для цикла и для одобренных черновиков."""
+async def after_ping(result, username, m, text, service, repo, sender, settings, now_utc,
+                     source=SRC_BOT):
+    """Учёт после отправки пинга — общий для цикла и для одобренных черновиков.
+    source — чей текст ушёл: модели (SRC_BOT) или правка ментора (SRC_BOT_EDIT)."""
     tz = ZoneInfo(settings.tz_name)
     if result in ("sent", "dry") and parse_stage(m.status) == "resume":
         # мяч у ментора: ученику пинг, ментору напоминание, что резюме за ним
@@ -175,7 +176,8 @@ async def after_ping(result, username, m, text, service, repo, sender, settings,
         except Exception:
             log.exception("sheet date write failed after ping")
             await sender.notify_mentor(f"⚠️ Пинг @{username} ушёл, но дата в таблице не записана")
-        await repo.log_message(username, "out", text, now_utc.isoformat())
+        # эхо этой отправки бизнес-роутер пропускает — в переписку пинг пишем сами
+        await repo.log_message(username, "out", text, now_utc.isoformat(), source=source)
     elif result == "dry":
         await repo.log_ping(username, now_utc.isoformat(), "dry")
 
@@ -212,6 +214,7 @@ async def send_ping_draft(pid, service, repo, sender, settings, text=None,
         return DraftOutcome(f"@{username} сейчас пинговать нельзя (пауза, стоп-статус или игнор) — не отправляю")
     if not await repo.claim("ping_drafts", pid):
         return DraftOutcome("Уже обработано")   # второе быстрое нажатие
+    edited = bool(text)
     text = text or d["text"]
     await repo.log_ping(username, now_utc.isoformat(), "attempt")
     try:
@@ -224,7 +227,8 @@ async def send_ping_draft(pid, service, repo, sender, settings, text=None,
         await repo.set_ping_draft_state(pid, "open")
         return DraftOutcome(f"Не отправлено: {result}", retry=True)
     await repo.set_ping_draft_state(pid, result)
-    await after_ping(result, username, m, text, service, repo, sender, settings, now_utc)
+    await after_ping(result, username, m, text, service, repo, sender, settings, now_utc,
+                     source=SRC_BOT_EDIT if edited else SRC_BOT)
     return DraftOutcome(f"Пинг @{username} отправлен" if result == "sent" else "Dry-run: ушло тебе")
 
 
@@ -236,10 +240,11 @@ async def drain_pending(service, repo, sender, settings, now_utc: datetime | Non
         username = row["username"]
         last_out = await repo.last_out_ts(username)
         if last_out and parse_iso_utc(last_out) > parse_iso_utc(row["last_in_ts"]):
-            # ментор ответил сам, пока буфер зрел — LLM не трогаем
-            await repo.drop_pending(username)
+            # ментор ответил сам, пока буфер зрел — LLM не трогаем. Снимаем только то, что видели:
+            # дописанное после выборки останется
+            await repo.consume_pending(username, row["max_id"])
             continue
-        texts = json.loads(row["texts"])
+        texts = row["texts"]
         text = "\n".join(texts)
         try:
             await service.handle_buffered(username, text, row["last_in_ts"])
@@ -261,10 +266,10 @@ async def drain_pending(service, repo, sender, settings, now_utc: datetime | Non
                 f"⚠️ Не смог разобрать сообщения @{username} ({type(e).__name__}), "
                 f"убрал из очереди: {text[:100]}"
             )
-            await repo.consume_pending(username, len(texts))
+            await repo.consume_pending(username, row["max_id"])
         else:
             # снимаем ровно то, что обработали: дописанное за это время останется
-            await repo.consume_pending(username, len(texts))
+            await repo.consume_pending(username, row["max_id"])
             if await repo.get_setting("alerted_llm_down"):
                 await repo.set_setting("alerted_llm_down", "")
                 await sender.notify_mentor("✅ LLM снова отвечает, разбираю отложенные сообщения")

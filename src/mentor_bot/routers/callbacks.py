@@ -5,6 +5,7 @@ from aiogram import F, Router
 from aiogram.types import CallbackQuery
 
 from mentor_bot.sheets import RowNotFound, StatusConflict
+from mentor_bot.store.repo import SRC_BOT, SRC_BOT_EDIT
 from mentor_bot.style import todo_marks
 
 log = logging.getLogger(__name__)
@@ -12,6 +13,13 @@ log = logging.getLogger(__name__)
 
 EDIT_KEY = "edit_target"
 EDIT_TTL = timedelta(minutes=30)   # забытая «✏️ Править» не должна отправить текст через сутки
+
+
+async def _log_sent(repo, username: str, text: str, source: str):
+    """Отправленное ботом — в переписку. Эхо этой отправки бизнес-роутер пропускает, иначе оно
+    сошло бы за ручной ответ ментора и закрыло чужие вопросы."""
+    await repo.log_message(username, "out", text, datetime.now(timezone.utc).isoformat(),
+                           source=source)
 
 
 async def start_edit(repo, kind: str, ident: int):
@@ -47,6 +55,8 @@ async def handle_q_callback(data: str, repo, sender, service) -> str:
         if result in ("sent", "dry"):
             await repo.set_question_state(q["id"], "sent")
             await repo.set_question_final(q["id"], q["draft"])
+            if result == "sent":
+                await _log_sent(repo, q["username"], q["draft"], SRC_BOT)
             return "Отправлено" if result == "sent" else "Dry-run: ушло тебе"
         await repo.set_question_state(q["id"], "open")
         return f"Не отправлено: {result}"
@@ -83,6 +93,8 @@ async def handle_edit_text(text: str, repo, sender, service) -> str | None:
             return f"Не отправлено: {result}. Пришли ещё раз или /cancel"
         await repo.set_question_state(q["id"], "sent")
         await repo.set_question_final(q["id"], text)
+        if result == "sent":
+            await _log_sent(repo, q["username"], text, SRC_BOT_EDIT)
         await repo.set_setting(EDIT_KEY, "")
         return f"Отправил @{q['username']} твой вариант" if result == "sent" else "Dry-run: ушло тебе"
     if kind == "p":

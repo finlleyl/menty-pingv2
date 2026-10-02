@@ -351,6 +351,9 @@ async def test_review_mode_then_approve(tmp_path):
     assert (await repo.get_mentee("ivan"))["unanswered_pings"] == 1
     assert sheets.dates   # дата в таблице обновлена так же, как при автопинге
     assert await handle_p_callback(f"p:send:{pid}", repo, sender, svc) == "Уже обработано"
+    # пинг — текст модели: в переписке есть, но ни ответом ментора, ни образцом стиля не считается
+    rows = await repo._all("SELECT text, source FROM messages WHERE username='ivan'")
+    assert rows == [{"text": "ПИНГ[Иван @ivan]", "source": "bot"}]
 
 
 async def test_ping_draft_goes_stale_when_mentee_writes(tmp_path):
@@ -378,6 +381,8 @@ async def test_edited_ping_is_sent(tmp_path):
     assert "отправлен" in out
     assert sender.mentee_msgs == [("ivan", "Ну что, как третий спринт?")]
     assert (await repo.get_ping_draft(pid))["state"] == "sent"
+    rows = await repo._all("SELECT text, source FROM messages WHERE username='ivan'")
+    assert rows == [{"text": "Ну что, как третий спринт?", "source": "bot_edit"}]
 
 
 async def _live(repo):

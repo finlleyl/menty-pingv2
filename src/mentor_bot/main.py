@@ -39,6 +39,10 @@ async def main():
     sender = Sender(bot, repo, settings.mentor_user_id)
     service = Service(repo, sheets, llm, sender, kb, settings)
     try:
+        await business.check_connection(bot, repo, sender, settings.mentor_user_id)
+    except Exception:
+        log.exception("business connection check failed on startup")
+    try:
         await service.sync_mentees()
         log.info("loaded %d mentees from sheet", len(service.by_username))
     except Exception:

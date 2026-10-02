@@ -214,3 +214,19 @@ async def test_ping_draft_not_sent_after_pause(tmp_path):
     await repo.set_pause("ivan", "2099-01-01T00:00:00+00:00")
     out = await handle_p_callback(f"p:send:{pid}", repo, sender, svc)
     assert "нельзя" in out and sender.mentee_msgs == []
+
+
+async def test_bot_sends_are_logged_with_their_source(tmp_path):
+    # эхо этих отправок бизнес-роутер пропускает, поэтому в переписку их пишет сам бот
+    from mentor_bot.routers.callbacks import handle_edit_text
+    repo, sheets, sender, svc = await make(tmp_path)
+    q1 = await repo.add_question("ivan", "вопрос", "черновик модели", "2026-08-19T10:00:00+00:00")
+    q2 = await repo.add_question("ivan", "ещё вопрос", "черновик", "2026-08-19T10:01:00+00:00")
+    await handle_q_callback(f"q:send:{q1}", repo, sender, svc)
+    await handle_q_callback(f"q:edit:{q2}", repo, sender, svc)
+    await handle_edit_text("мой вариант ответа", repo, sender, svc)
+    rows = await repo._all("SELECT text, source FROM messages WHERE username='ivan' ORDER BY id")
+    assert rows == [{"text": "черновик модели", "source": "bot"},
+                    {"text": "мой вариант ответа", "source": "bot_edit"}]
+    assert (await repo.get_question(q2))["state"] == "sent"     # первая отправка его не закрыла
+    assert await repo.last_out_ts("ivan") is None               # и ручным ответом не считается

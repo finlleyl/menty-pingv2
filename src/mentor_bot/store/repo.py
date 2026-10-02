@@ -15,6 +15,13 @@ ANSWER_WINDOW_HOURS = 6     # сколько после вопроса ждём 
 KIND_QUESTION = "question"
 KIND_HUMAN = "human"
 
+# messages.source — откуда сообщение. Ответом ментора «в чате» считается только SRC_CHAT:
+# отправки самого бота и автоответы Business не закрывают вопросы и не учат черновики
+SRC_CHAT = "chat"            # написано руками в Telegram — ментором или учеником
+SRC_BOT = "bot"              # текст модели, отправленный ботом: пинг, черновик как есть
+SRC_BOT_EDIT = "bot_edit"    # правка ментора, отправленная ботом
+SRC_AUTO = "auto"            # автоответ Telegram Business или отложенное сообщение
+
 # Образцы стиля ментора: короче — «ок», длиннее — простыня, по которой тон не поймать
 STYLE_MIN_CHARS = 15
 STYLE_MAX_CHARS = 600
@@ -31,6 +38,7 @@ class Repo:
         conn.row_factory = aiosqlite.Row
         await conn.executescript(SCHEMA)
         await cls._migrate(conn)
+        await cls._migrate_pending(conn)
         await conn.commit()
         return cls(conn)
 
@@ -43,10 +51,29 @@ class Repo:
             ("questions", "emb", "TEXT"),
             # до разбора эмоций все черновики были ответами на вопросы — отсюда и DEFAULT
             ("questions", "kind", f"TEXT NOT NULL DEFAULT '{KIND_QUESTION}'"),
+            ("messages", "source", f"TEXT NOT NULL DEFAULT '{SRC_CHAT}'"),
         ):
             cur = await conn.execute(f"PRAGMA table_info({table})")
             if col not in {row[1] for row in await cur.fetchall()}:
                 await conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+
+    @staticmethod
+    async def _migrate_pending(conn):
+        """Буфер старого формата (JSON-список в pending.texts) — в построчный pending_messages."""
+        cur = await conn.execute(
+            "SELECT username, last_in_ts, texts FROM pending WHERE texts NOT IN ('', '[]')"
+        )
+        for username, last_in_ts, texts in await cur.fetchall():
+            try:
+                old = json.loads(texts)
+            except ValueError:
+                old = []      # битый буфер не должен ронять старт бота
+            for text in old:
+                await conn.execute(
+                    "INSERT INTO pending_messages(username, text, ts) VALUES (?,?,?)",
+                    (username, text, last_in_ts),
+                )
+            await conn.execute("UPDATE pending SET texts='[]' WHERE username=?", (username,))
 
     async def close(self):
         await self._c.close()
@@ -133,10 +160,10 @@ class Repo:
         await self._exec("UPDATE mentees SET unanswered_pings=0 WHERE username=?", (username,))
 
     # messages
-    async def log_message(self, username, direction, text, ts_iso):
+    async def log_message(self, username, direction, text, ts_iso, source=SRC_CHAT):
         await self._exec(
-            "INSERT INTO messages(username, direction, text, ts) VALUES (?,?,?,?)",
-            (username, direction, text, ts_iso),
+            "INSERT INTO messages(username, direction, text, ts, source) VALUES (?,?,?,?,?)",
+            (username, direction, text, ts_iso, source),
         )
 
     async def last_message_ts(self, username):
@@ -146,9 +173,11 @@ class Repo:
         return row["ts"] if row else None
 
     async def last_out_ts(self, username):
+        """Когда ментор последний раз написал ученику сам, в Telegram. Отправки бота (черновик
+        по кнопке, пинг) и автоответы Business не в счёт: это не «ментор ответил сам»."""
         row = await self._one(
             "SELECT ts FROM messages WHERE username=? AND direction='out' "
-            "ORDER BY ts DESC LIMIT 1",
+            f"AND source='{SRC_CHAT}' ORDER BY ts DESC LIMIT 1",
             (username,),
         )
         return row["ts"] if row else None
@@ -239,6 +268,7 @@ class Repo:
         rows = await self._all(
             "SELECT m.username, m.text FROM messages m "
             "WHERE m.direction='out' AND m.text != '[медиа]' AND length(m.text) BETWEEN ? AND ? "
+            f"AND m.source IN ('{SRC_CHAT}', '{SRC_BOT_EDIT}') "
             "AND m.username IN (SELECT username FROM mentees WHERE sheet_title IS NOT NULL) "
             "AND NOT EXISTS (SELECT 1 FROM pings p WHERE p.username=m.username "
             "AND p.ts=m.ts AND p.status='sent') "
@@ -346,51 +376,80 @@ class Repo:
             (key, value),
         )
 
-    # pending — буфер входящих до дебаунса
+    # pending — буфер входящих до дебаунса. Окно (last_in_ts) — в pending, сами сообщения —
+    # построчно в pending_messages: aiogram разбирает апдейты параллельно, и чтение-изменение-
+    # запись одного JSON-списка теряло сообщения, пришедшие пачкой
     async def buffer_incoming(self, username, text, ts_iso):
-        row = await self._one("SELECT texts FROM pending WHERE username=?", (username,))
-        texts = json.loads(row["texts"]) if row else []
-        texts.append(text)
-        await self._exec(
-            "INSERT INTO pending(username, last_in_ts, texts) VALUES (?,?,?) "
-            "ON CONFLICT(username) DO UPDATE SET "
-            "last_in_ts=excluded.last_in_ts, texts=excluded.texts",
-            (username, ts_iso, json.dumps(texts, ensure_ascii=False)),
+        await self._c.execute(
+            "INSERT INTO pending(username, last_in_ts, texts) VALUES (?,?,'[]') "
+            "ON CONFLICT(username) DO UPDATE SET last_in_ts=MAX(last_in_ts, excluded.last_in_ts)",
+            (username, ts_iso),
         )
+        await self._c.execute(
+            "INSERT INTO pending_messages(username, text, ts) VALUES (?,?,?)",
+            (username, text, ts_iso),
+        )
+        await self._c.commit()
 
     async def touch_pending(self, username, ts_iso):
         """Продлить окно, не добавляя текст (медиа без подписи). Нет буфера — no-op."""
-        await self._exec("UPDATE pending SET last_in_ts=? WHERE username=?", (ts_iso, username))
+        await self._exec(
+            "UPDATE pending SET last_in_ts=MAX(last_in_ts, ?) WHERE username=? "
+            "AND EXISTS (SELECT 1 FROM pending_messages WHERE username=?)",
+            (ts_iso, username, username),
+        )
 
     async def get_pending(self, username):
-        return await self._one("SELECT * FROM pending WHERE username=?", (username,))
+        """{"last_in_ts", "texts": [...]} или None, если буфер пуст."""
+        rows = await self._all(
+            "SELECT text, ts FROM pending_messages WHERE username=? ORDER BY id", (username,)
+        )
+        if not rows:
+            return None
+        window = await self._one("SELECT last_in_ts FROM pending WHERE username=?", (username,))
+        last = max([r["ts"] for r in rows] + ([window["last_in_ts"]] if window else []))
+        return {"username": username, "last_in_ts": last, "texts": [r["text"] for r in rows]}
 
     async def drop_pending(self, username):
-        await self._exec("DELETE FROM pending WHERE username=?", (username,))
+        await self._c.execute("DELETE FROM pending_messages WHERE username=?", (username,))
+        await self._c.execute("DELETE FROM pending WHERE username=?", (username,))
+        await self._c.commit()
 
-    async def consume_pending(self, username, consumed: int):
-        """Снять с буфера первые `consumed` сообщений.
+    async def consume_pending(self, username, upto_id: int):
+        """Снять с буфера разобранное — сообщения с id не больше upto_id.
 
-        Пока дренаж ждал ответа модели, ученик мог дописать ещё — их допишет
-        buffer_incoming в ту же строку. Удалять строку целиком нельзя (потеряем
-        свежее), оставлять целиком тоже (обработанное уйдёт в модель второй раз).
-        """
-        row = await self._one("SELECT texts FROM pending WHERE username=?", (username,))
-        if row is None:
-            return
-        rest = json.loads(row["texts"])[consumed:]
-        if rest:
-            await self._exec(
-                "UPDATE pending SET texts=? WHERE username=?",
-                (json.dumps(rest, ensure_ascii=False), username),
-            )
-        else:
-            await self._exec("DELETE FROM pending WHERE username=?", (username,))
+        Пока дренаж ждал ответа модели, ученик мог дописать ещё, а ментор — ответить сам
+        (drop_pending) и ученик — написать снова. Снимаем по id, а не «первые N»: дописанное
+        после разбора останется, даже если буфер успели удалить и завести заново."""
+        await self._c.execute(
+            "DELETE FROM pending_messages WHERE username=? AND id<=?", (username, upto_id)
+        )
+        await self._c.execute(
+            "DELETE FROM pending WHERE username=? "
+            "AND NOT EXISTS (SELECT 1 FROM pending_messages WHERE username=?)",
+            (username, username),
+        )
+        await self._c.commit()
 
     async def mature_pending(self, before_iso):
-        return await self._all(
-            "SELECT * FROM pending WHERE last_in_ts < ? ORDER BY last_in_ts", (before_iso,)
+        """Буферы, в которые ученик не писал с before_iso: [{username, last_in_ts, max_id, texts}].
+        max_id — до какого сообщения снимать после разбора (consume_pending)."""
+        # LEFT JOIN: сообщение без строки окна (её успел снять consume) всё равно разберётся
+        windows = await self._all(
+            "SELECT m.username, MAX(m.id) AS max_id, "
+            "MAX(MAX(m.ts), COALESCE(p.last_in_ts, '')) AS last_in_ts "
+            "FROM pending_messages m LEFT JOIN pending p ON p.username = m.username "
+            "GROUP BY m.username HAVING MAX(MAX(m.ts), COALESCE(p.last_in_ts, '')) < ? "
+            "ORDER BY last_in_ts",
+            (before_iso,),
         )
+        for w in windows:
+            rows = await self._all(
+                "SELECT text FROM pending_messages WHERE username=? AND id<=? ORDER BY id",
+                (w["username"], w["max_id"]),
+            )
+            w["texts"] = [r["text"] for r in rows]
+        return windows
 
     # llm_usage — учёт токенов и денег
     async def log_usage(self, ts_iso, task, model, prompt_tokens, completion_tokens, cost):

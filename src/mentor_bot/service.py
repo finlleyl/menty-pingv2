@@ -216,6 +216,12 @@ class Service:
         wants_reply = tri.needs_reply or tri.urgent or tri.milestone != "none"
         if wants_reply and any(k in REPLY_KINDS for k in kinds):
             draft = await self._compose_draft(username, m, text, ts_iso, tri, kinds, prior)
+            # пока модель писала, ментор мог ответить в чате сам — карточка уже не нужна, а вопрос,
+            # заведённый после его ответа, так и висел бы открытым
+            last_out = await self.repo.last_out_ts(username)
+            if last_out and parse_iso_utc(last_out) > parse_iso_utc(ts_iso):
+                log.info("mentor replied to %s while drafting, draft dropped", username)
+                draft = None
         try:
             if draft is not None:
                 await self._deliver_draft(username, status, text, ts_iso, kinds, tri.urgent, draft)

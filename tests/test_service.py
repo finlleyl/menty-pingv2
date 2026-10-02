@@ -1,4 +1,3 @@
-import json
 from datetime import date
 
 import pytest
@@ -138,7 +137,7 @@ async def test_incoming_buffers_and_never_calls_llm(tmp_path):
     svc.llm.triage = boom
     await svc.on_incoming("ivan", "что такое mutex?", "2026-08-19T10:00:00+00:00")
     row = await repo.get_pending("ivan")
-    assert json.loads(row["texts"]) == ["что такое mutex?"]
+    assert row["texts"] == ["что такое mutex?"]
     assert await repo.open_questions() == []
 
 
@@ -164,7 +163,7 @@ async def test_contact_only_extends_window_without_text(tmp_path):
     await svc.on_contact_only("ivan", "in", "2026-08-19T10:02:00+00:00")
     row = await repo.get_pending("ivan")
     assert row["last_in_ts"] == "2026-08-19T10:02:00+00:00"
-    assert json.loads(row["texts"]) == ["смотри"]
+    assert row["texts"] == ["смотри"]
 
 
 async def test_progress_high_confidence_creates_proposal_not_write(tmp_path):
@@ -686,3 +685,18 @@ async def test_human_draft_learns_only_from_human_edits(tmp_path):
     await repo.close_open_questions("petr")
     await svc.handle_buffered("ivan", "что-то сил нет", TS)
     assert [e["final"] for e in llm.draft_calls[0]["examples"]] == ["отдохни, потом добьём"]
+
+
+async def test_mentor_reply_while_drafting_drops_the_card(tmp_path):
+    repo, sender, kb, llm, svc = await make_triaged(tmp_path, kinds=["tech_question"])
+    draft_reply = llm.draft_reply
+
+    async def slow_draft(text, kinds, **ctx):
+        # пока модель пишет, ментор ответил в чате сам
+        await svc.on_outgoing("ivan", "закрывает отправитель, вот пример с close(ch)",
+                              "2026-08-20T10:06:00+00:00")
+        return await draft_reply(text, kinds, **ctx)
+
+    llm.draft_reply = slow_draft
+    await svc.handle_buffered("ivan", "кто закрывает канал?", "2026-08-20T10:00:00+00:00")
+    assert sender.mentor_msgs == [] and await repo.open_questions() == []

@@ -9,12 +9,16 @@ CREATE TABLE IF NOT EXISTS mentees(
   status_since TEXT,
   last_status TEXT
 );
+-- source: 'chat' — написано в Telegram руками (ментором или учеником); 'bot' — текст модели,
+-- отправленный ботом (пинг, черновик как есть); 'bot_edit' — правка ментора, отправленная ботом;
+-- 'auto' — автоответ Telegram Business или отложенное сообщение
 CREATE TABLE IF NOT EXISTS messages(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   username TEXT NOT NULL,
   direction TEXT NOT NULL,
   text TEXT NOT NULL,
-  ts TEXT NOT NULL
+  ts TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'chat'
 );
 CREATE INDEX IF NOT EXISTS idx_messages_user_ts ON messages(username, ts);
 CREATE TABLE IF NOT EXISTS pings(
@@ -50,11 +54,21 @@ CREATE TABLE IF NOT EXISTS profiles(
   summary TEXT NOT NULL,
   updated_ts TEXT NOT NULL
 );
+-- окно дебаунса: когда ученик последний раз что-то присылал (texts — от старого формата буфера)
 CREATE TABLE IF NOT EXISTS pending(
   username   TEXT PRIMARY KEY,
   last_in_ts TEXT NOT NULL,
   texts      TEXT NOT NULL
 );
+-- сами сообщения буфера — по строке на сообщение: дописать и снять разобранное можно одним
+-- запросом, без чтения-изменения-записи, и параллельные апдейты не затирают друг друга
+CREATE TABLE IF NOT EXISTS pending_messages(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL,
+  text TEXT NOT NULL,
+  ts TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pending_messages_user ON pending_messages(username, id);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS status_history(
   id INTEGER PRIMARY KEY AUTOINCREMENT,

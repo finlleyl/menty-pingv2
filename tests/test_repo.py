@@ -252,3 +252,27 @@ async def test_question_kind_migrates_on_old_database(tmp_path):
     repo = await Repo.open(path)
     assert (await repo.get_question(hid))["kind"] == "human"
     await repo.close()
+
+
+async def test_only_messages_typed_in_chat_count_as_mentor_answer(tmp_path):
+    from mentor_bot.store.repo import SRC_AUTO, SRC_BOT, SRC_BOT_EDIT
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    await repo.log_message("ivan", "out", "черновик по кнопке", "2026-09-01T10:00:00+00:00", source=SRC_BOT)
+    await repo.log_message("ivan", "out", "правка по кнопке", "2026-09-01T10:01:00+00:00", source=SRC_BOT_EDIT)
+    await repo.log_message("ivan", "out", "меня нет, отвечу позже", "2026-09-01T10:02:00+00:00", source=SRC_AUTO)
+    assert await repo.last_out_ts("ivan") is None
+    assert await repo.last_message_ts("ivan") == "2026-09-01T10:02:00+00:00"   # но контакт был
+    await repo.log_message("ivan", "out", "сам ответил", "2026-09-01T10:03:00+00:00")
+    assert await repo.last_out_ts("ivan") == "2026-09-01T10:03:00+00:00"
+    await repo.close()
+
+
+async def test_style_samples_take_mentor_edits_but_not_model_text(tmp_path):
+    from mentor_bot.store.repo import SRC_AUTO, SRC_BOT, SRC_BOT_EDIT
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    await repo.upsert_mentee("ivan", sheet_title="A", row=3)
+    await repo.log_message("ivan", "out", "Как там спринт, где застрял?", "2026-09-01T10:00:00+00:00", source=SRC_BOT)
+    await repo.log_message("ivan", "out", "Я сейчас не на связи, отвечу позже", "2026-09-01T10:01:00+00:00", source=SRC_AUTO)
+    await repo.log_message("ivan", "out", "close(ch) только со стороны отправителя", "2026-09-01T10:02:00+00:00", source=SRC_BOT_EDIT)
+    assert await repo.style_samples() == ["close(ch) только со стороны отправителя"]
+    await repo.close()

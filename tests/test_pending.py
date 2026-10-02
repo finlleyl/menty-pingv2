@@ -1,4 +1,4 @@
-import json
+import asyncio
 
 from mentor_bot.store.repo import Repo
 
@@ -8,7 +8,7 @@ async def test_buffer_accumulates_and_moves_window(tmp_path):
     await repo.buffer_incoming("ivan", "привет", "2026-08-27T10:00:00+00:00")
     await repo.buffer_incoming("ivan", "а вот ещё", "2026-08-27T10:00:30+00:00")
     row = await repo.get_pending("ivan")
-    assert json.loads(row["texts"]) == ["привет", "а вот ещё"]
+    assert row["texts"] == ["привет", "а вот ещё"]
     assert row["last_in_ts"] == "2026-08-27T10:00:30+00:00"
     await repo.close()
 
@@ -22,7 +22,7 @@ async def test_touch_pending_extends_window_only_if_buffer_exists(tmp_path):
     await repo.touch_pending("ivan", "2026-08-27T10:02:00+00:00")
     row = await repo.get_pending("ivan")
     assert row["last_in_ts"] == "2026-08-27T10:02:00+00:00"
-    assert json.loads(row["texts"]) == ["привет"]  # текст не добавился
+    assert row["texts"] == ["привет"]  # текст не добавился
     await repo.close()
 
 
@@ -134,7 +134,7 @@ async def test_drain_keeps_messages_that_arrived_during_processing(tmp_path):
     await drain_pending(svc, repo, sender, Cfg3(), now_utc=NOW)
     row = await repo.get_pending("ivan")
     assert row is not None                                    # новое сообщение не потеряно
-    assert json.loads(row["texts"]) == ["а ещё вопрос"]        # обработанное убрано, дублей не будет
+    assert row["texts"] == ["а ещё вопрос"]        # обработанное убрано, дублей не будет
     assert row["last_in_ts"] == "2026-08-27T10:09:00+00:00"
 
 
@@ -150,7 +150,7 @@ async def test_drain_keeps_late_message_even_when_handling_raises(tmp_path):
     await drain_pending(svc, repo, sender, Cfg3(), now_utc=NOW)
     row = await repo.get_pending("ivan")
     # сломанное сообщение выброшено, свежее осталось — цикла не будет
-    assert json.loads(row["texts"]) == ["а ещё вопрос"]
+    assert row["texts"] == ["а ещё вопрос"]
 
 
 from mentor_bot.llm import LLMUnavailable
@@ -170,7 +170,7 @@ async def test_drain_keeps_buffer_while_llm_is_down_and_alerts_once(tmp_path):
     await drain_pending(svc, repo, sender, Cfg3(), now_utc=NOW)
     await drain_pending(svc, repo, sender, Cfg3(), now_utc=NOW)
     # сообщения учеников на месте — ждут, пока провайдер оживёт
-    assert json.loads((await repo.get_pending("ivan"))["texts"]) == ["Хорошо, спасибо!"]
+    assert (await repo.get_pending("ivan"))["texts"] == ["Хорошо, спасибо!"]
     assert await repo.get_pending("petr") is not None
     # упёрлись в первый же буфер — остальные в тот же тик не дёргаем
     assert calls == ["ivan", "ivan"]
@@ -197,3 +197,37 @@ async def test_drain_announces_recovery_and_rearms_alert(tmp_path):
     assert await repo.get_pending("ivan") is None             # отложенное разобрано
     assert any("снова отвечает" in m[0] for m in sender.mentor_msgs)
     assert not await repo.get_setting("alerted_llm_down")     # следующий простой снова предупредит
+
+
+async def test_burst_of_parallel_messages_is_buffered_whole(tmp_path):
+    # aiogram разбирает апдейты пачки параллельно: раньше в буфере оставалось последнее
+    repo, sender, svc = await make_svc(tmp_path)
+    texts = ["привет", "вопрос по каналам", "x := <-ch", "почему дедлок?"]
+    await asyncio.gather(*(svc.on_incoming("ivan", t, f"2026-08-27T10:00:0{i}+00:00")
+                           for i, t in enumerate(texts)))
+    assert sorted((await repo.get_pending("ivan"))["texts"]) == sorted(texts)
+
+
+async def test_consume_after_drop_keeps_the_new_buffer(tmp_path):
+    # разбор шёл, ментор ответил сам (буфер снесён), ученик написал снова — новое не трогаем
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    await repo.buffer_incoming("ivan", "вопрос", "2026-08-27T10:00:00+00:00")
+    [row] = await repo.mature_pending("2026-08-27T10:05:00+00:00")
+    await repo.drop_pending("ivan")
+    await repo.buffer_incoming("ivan", "а теперь другое", "2026-08-27T10:07:00+00:00")
+    await repo.consume_pending("ivan", row["max_id"])
+    assert (await repo.get_pending("ivan"))["texts"] == ["а теперь другое"]
+    await repo.close()
+
+
+async def test_legacy_json_buffer_survives_upgrade(tmp_path):
+    path = str(tmp_path / "t.db")
+    repo = await Repo.open(path)
+    # так буфер лежал до построчного формата
+    await repo._exec("INSERT INTO pending(username, last_in_ts, texts) VALUES (?,?,?)",
+                     ("ivan", "2026-08-27T10:00:00+00:00", '["привет", "вопрос"]'))
+    await repo.close()
+    repo = await Repo.open(path)
+    [row] = await repo.mature_pending("2026-08-27T10:05:00+00:00")
+    assert row["texts"] == ["привет", "вопрос"]
+    await repo.close()

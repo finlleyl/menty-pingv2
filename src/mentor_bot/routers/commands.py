@@ -48,8 +48,11 @@ async def status_text(service, repo, settings, now_utc: datetime) -> str:
         ):
             due.append(username)
     open_qs = await repo.open_questions()
+    business = ("подключён" if await repo.get_setting("bconn")
+                else "не подключён — подключусь по первому сообщению ученика")
     lines = [
         f"Менти в таблице: {len(service.by_username)}",
+        f"Telegram для бизнеса: {business}",
         f"dry-run: {'ON' if dryrun else 'OFF'} | pause_all: {'ON' if pause_all else 'OFF'}",
         f"Пора пинговать ({len(due)}): " + _listing(due),
         f"Чат не привязан ({len(unbound)}): " + _listing(unbound),
