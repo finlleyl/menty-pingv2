@@ -155,6 +155,9 @@ def test_forbidden_hits_catches_call_offer_in_ping():
     assert forbidden_hits("Где застрял? Давай в зум на полчаса", "unknown") == ["созвоны"]
     # мок — это и есть созвон по регламенту
     assert forbidden_hits("Когда удобно созвониться на мок-собес?", "mock") == []
+    # звонки рекрутеров на «Рынке» — законная тема, а не предложение созвона с ментором
+    assert forbidden_hits("Как отклики, рекрутеры звонят?", "market") == []
+    assert forbidden_hits("Давай прогоним ещё один мок перед собесами", "market") == ["созвоны"]
 
 
 def test_call_permission_follows_the_regulation():

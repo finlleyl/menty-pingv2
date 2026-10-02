@@ -49,6 +49,16 @@ async def test_q_send(tmp_path):
     assert "Отправлено" in out
 
 
+async def test_q_send_refuses_draft_with_mentor_marker(tmp_path):
+    repo, sheets, sender, svc = await make(tmp_path)
+    qid = await repo.add_question("ivan", "вопрос", "Закрывает отправитель. [срок - допиши сам]",
+                                  "2026-08-19T10:00:00+00:00")
+    out = await handle_q_callback(f"q:send:{qid}", repo, sender, svc)
+    assert out == "В черновике осталась пометка [срок - допиши сам] - нажми ✏️ Править"
+    assert sender.mentee_msgs == []
+    assert (await repo.get_question(qid))["state"] == "open"     # «Править» по-прежнему работает
+
+
 async def test_q_send_error_keeps_open(tmp_path):
     repo, sheets, sender, svc = await make(tmp_path)
     qid = await repo.add_question("ivan", "вопрос", "черновик", "2026-08-19T10:00:00+00:00")

@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS pings(
   ts TEXT NOT NULL,
   status TEXT NOT NULL
 );
+-- без индекса style_samples на каждый черновик сканирует pings для каждого исходящего
+CREATE INDEX IF NOT EXISTS idx_pings_user_ts ON pings(username, ts);
 CREATE TABLE IF NOT EXISTS questions(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   username TEXT NOT NULL,
@@ -35,6 +37,8 @@ CREATE TABLE IF NOT EXISTS questions(
   emb TEXT,
   kind TEXT NOT NULL DEFAULT 'question'
 );
+-- style_samples отсекает черновики, ушедшие как есть, сравнением текста — без индекса это скан
+CREATE INDEX IF NOT EXISTS idx_questions_draft ON questions(draft);
 CREATE TABLE IF NOT EXISTS proposals(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   username TEXT NOT NULL,

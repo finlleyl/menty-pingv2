@@ -11,7 +11,7 @@ from mentor_bot.llm import looks_like_interview, looks_like_verdict
 from mentor_bot.pings import parse_iso_utc
 from mentor_bot.stages import STAGE_LABELS, call_permission, parse_stage
 from mentor_bot.store.repo import KIND_HUMAN, KIND_QUESTION
-from mentor_bot.style import TECH_KINDS, draft_problems, normalize_dashes
+from mentor_bot.style import TECH_KINDS, draft_problems, normalize_dashes, todo_marks
 
 log = logging.getLogger(__name__)
 
@@ -24,6 +24,8 @@ REPLY_KINDS = ("tech_question", "org_question", "feelings", "win")
 
 DIALOG_LIMIT = 10      # сколько прошлой переписки видят сортировщик и черновик
 ONGOING_HOURS = 12     # писали друг другу в эти часы — диалог идёт, «Привет!» в ответе лишний
+# У Telegram предел 4096 символов, но эмодзи считаются в UTF-16 за два — держим запас
+NOTIFY_LIMIT = 4000
 
 
 def _kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
@@ -65,6 +67,10 @@ def _kinds(tri) -> list[str]:
     # сдал спринт / легенда готова — это и смена этапа; решает всё равно ментор кнопкой
     if tri.milestone != "none" and "status_change" not in kinds:
         kinds.append("status_change")
+    # и это успех: ровно здесь регламент разрешает позвать на собес по спринту или мок,
+    # поэтому черновик нужен, даже если модель поставила одну смену этапа
+    if tri.milestone != "none" and not any(k in REPLY_KINDS for k in kinds):
+        kinds.append("win")
     # человеку плохо — черновик нужен, даже если модель не поставила «переживания»
     if tri.urgent and not any(k in REPLY_KINDS for k in kinds):
         kinds.append("feelings")
@@ -76,7 +82,7 @@ def _header(username: str, kinds: list[str], urgent: bool) -> str:
     if "feelings" in kinds:
         head = f"💬 @{username} делится и спрашивает:" if question else f"💬 @{username} делится:"
     elif "win" in kinds:
-        head = f"🎉 @{username}:"
+        head = f"🎉 @{username} делится успехом и спрашивает:" if question else f"🎉 @{username}:"
     else:
         head = f"❓ @{username} спрашивает:"
     return f"🔥 {head}" if urgent else head
@@ -204,14 +210,19 @@ class Service:
         if "status_change" in kinds and m is not None:
             upd = await self.llm.parse_status(text, status)
         draft = None
-        if (tri.needs_reply or tri.urgent) and any(k in REPLY_KINDS for k in kinds):
+        wants_reply = tri.needs_reply or tri.urgent or tri.milestone != "none"
+        if wants_reply and any(k in REPLY_KINDS for k in kinds):
             draft = await self._compose_draft(username, m, text, ts_iso, tri, kinds, prior)
-        if draft is not None:
-            await self._deliver_draft(username, status, text, ts_iso, kinds, tri.urgent, draft)
-        if upd is not None and upd.new_status:
-            hint = "уверенно" if upd.confidence == "high" else "под вопросом"
-            await self._propose(username, m, upd.new_status, text, f"@{username} написал",
-                                f" ({hint})")
+        try:
+            if draft is not None:
+                await self._deliver_draft(username, status, text, ts_iso, kinds, tri.urgent, draft)
+        finally:
+            # Telegram отверг черновик — предложение статуса всё равно нужно: раньше
+            # «сдал спринт» гарантированно давал кнопки, и сбой в соседнем шаге их не отменяет
+            if upd is not None and upd.new_status:
+                hint = "уверенно" if upd.confidence == "high" else "под вопросом"
+                await self._propose(username, m, upd.new_status, text, f"@{username} написал",
+                                    f" ({hint})")
         # фидбэк с собеса — последним и без права уронить разбор: основное уже сделано,
         # и повтор буфера из-за этого шага продублировал бы черновики и предложения
         if (m is not None and parse_stage(m.status) in ("interviews", "market")
@@ -225,8 +236,13 @@ class Service:
         """Черновик ответа: генерация → проверка кодом → при нарушении одна переписка."""
         status = m.status if m else None
         stage = parse_stage(status)
-        # регламент считает код, а не модель: созвон только после спринта или к моку
-        call = call_permission(tri.milestone, stage)
+        # регламент считает код, а не модель: созвон только после спринта или к моку.
+        # Человеку плохо — никаких приглашений: решать, что дальше, будет ментор
+        call = None if tri.urgent else call_permission(tri.milestone, stage)
+        # на стадии «Мок» разрешение висит на любом сообщении — без «легенда готова» модель
+        # получает правило мягче, иначе пристегнёт «когда удобно мок?» и к «устал»
+        if call == "mock" and tri.milestone != "legend_ready":
+            call = "mock_stage"
         question = any(k in TECH_KINDS for k in kinds)
         group = KIND_QUESTION if question else KIND_HUMAN
         ongoing = _ongoing(prior, text, ts_iso)
@@ -243,11 +259,11 @@ class Service:
             samples=samples, call=call, urgent=tri.urgent, ongoing=ongoing,
         )
         reply = await self.llm.draft_reply(text, kinds, **ctx)
-        problems = draft_problems(reply, kinds, call, ongoing)
+        problems = draft_problems(reply, kinds, call, ongoing, samples)
         if problems:
             log.warning("draft for %s failed lint %s, regenerating", username, problems)
             reply = await self.llm.draft_reply(text, kinds, **ctx, avoid=problems)
-            problems = draft_problems(reply, kinds, call, ongoing)
+            problems = draft_problems(reply, kinds, call, ongoing, samples)
         return Draft(normalize_dashes(reply, samples), problems, emb, group, len(similar))
 
     async def _stage_line(self, username: str, status, ts_iso: str) -> str:
@@ -265,15 +281,30 @@ class Service:
 
     async def _deliver_draft(self, username, status, text, ts_iso, kinds, urgent, d: Draft):
         qid = await self.repo.add_question(username, text, d.text, ts_iso, emb=d.emb, kind=d.kind)
-        # ментор читает каждый черновик, поэтому недочищенное не прячем, а подсвечиваем
-        warn = f"\n\n⚠️ проверь: {'; '.join(d.problems)}" if d.problems else ""
+        # ментор читает каждый черновик, поэтому недочищенное не прячем, а подсвечиваем.
+        # Пометка «допиши сам» — не ошибка модели, переписывать из-за неё нельзя (выдумает
+        # факты), но и уйти ученику она не должна: «Отправить» с ней откажет
+        warns = d.problems + [f"пометка {m} - замени через ✏️ Править" for m in todo_marks(d.text)]
+        warn = f"\n\n⚠️ проверь: {'; '.join(warns)}" if warns else ""
         note = f"\n\n(учтено твоих прошлых ответов на похожее: {d.similar})" if d.similar else ""
-        await self.sender.notify_mentor(
-            f"{_header(username, kinds, urgent)}\n{text}{await self._stage_line(username, status, ts_iso)}"
-            f"\n\nЧЕРНОВИК:\n{d.text}{warn}{note}",
-            reply_markup=_kb([[("Отправить", f"q:send:{qid}"), ("✏️ Править", f"q:edit:{qid}"),
-                               ("Игнор", f"q:ign:{qid}")]]),
-        )
+        head = _header(username, kinds, urgent)
+        tail = (f"{await self._stage_line(username, status, ts_iso)}"
+                f"\n\nЧЕРНОВИК:\n{d.text}{warn}{note}")
+        # ученик вставил лог на 3 тыс. символов — Telegram отверг бы всё сообщение. Полный
+        # текст есть в чате и в questions, а черновик не режем: «Отправить» берёт его из базы
+        room = NOTIFY_LIMIT - len(head) - len(tail) - 1
+        shown = text if len(text) <= room else text[:max(200, room - 1)] + "…"
+        try:
+            await self.sender.notify_mentor(
+                f"{head}\n{shown}{tail}",
+                reply_markup=_kb([[("Отправить", f"q:send:{qid}"), ("✏️ Править", f"q:edit:{qid}"),
+                                   ("Игнор", f"q:ign:{qid}")]]),
+            )
+        except Exception:
+            # ментор черновик не увидел — открытым не держим, иначе remind_cycle напомнит
+            # о сообщении, кнопок к которому у него нет
+            await self.repo.set_question_state(qid, "ignored")
+            raise
 
     async def _collect_interview(self, username: str, text: str, ts_iso: str):
         report = await self.llm.extract_interview(text)

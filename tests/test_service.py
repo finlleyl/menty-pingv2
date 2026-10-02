@@ -1,6 +1,8 @@
 import json
 from datetime import date
 
+import pytest
+
 from mentor_bot.llm import StatusUpdate, Triage
 from mentor_bot.service import Service
 from mentor_bot.sheets import SheetMentee
@@ -480,7 +482,7 @@ async def test_call_offer_outside_regulation_is_rewritten_once(tmp_path):
     )
     await svc.handle_buffered("ivan", "застрял на каналах", TS)
     assert len(llm.draft_calls) == 2
-    assert llm.draft_calls[1]["avoid"][0].startswith("предлагает созвон")
+    assert llm.draft_calls[1]["avoid"][0].startswith("упоминает созвон")
     assert (await repo.open_questions())[0]["draft"] == "Скинь код и текст ошибки, гляну"
     assert "⚠️" not in sender.mentor_msgs[0][0]
 
@@ -493,7 +495,7 @@ async def test_stubborn_call_offer_reaches_mentor_with_warning(tmp_path):
     await svc.handle_buffered("ivan", "застрял на каналах", TS)
     assert len(llm.draft_calls) == 2                          # переписываем один раз, не больше
     text = sender.mentor_msgs[0][0]
-    assert "⚠️ проверь: предлагает созвон" in text
+    assert "⚠️ проверь: упоминает созвон" in text
     # предупреждение — только ментору: ученику по кнопке уйдёт чистый черновик
     assert (await repo.open_questions())[0]["draft"] == "Ну давай тогда в зум на полчаса"
 
@@ -510,10 +512,27 @@ async def test_cliches_trigger_rewrite(tmp_path):
 
 async def test_mock_stage_allows_offering_the_mock(tmp_path):
     repo, sender, kb, llm, svc = await make_triaged(
-        tmp_path, sheet_status="Мок", kinds=["org_question"], drafts=["Го созвонимся на мок в четверг?"],
+        tmp_path, sheet_status="Мок", kinds=["org_question"], drafts=["Го созвонимся на мок, когда удобно?"],
     )
     await svc.handle_buffered("ivan", "когда мок?", TS)
-    assert llm.draft_calls[0]["call"] == "mock" and len(llm.draft_calls) == 1
+    # стадия «Мок» без «легенда готова» — мягкое правило: про мок, только если он сам спросил
+    assert llm.draft_calls[0]["call"] == "mock_stage" and len(llm.draft_calls) == 1
+
+
+async def test_legend_ready_on_mock_stage_gets_the_full_mock_rule(tmp_path):
+    repo, sender, kb, llm, svc = await make_triaged(
+        tmp_path, sheet_status="Мок", kinds=["win"], milestone="legend_ready",
+    )
+    await svc.handle_buffered("ivan", "легенду дописал наконец", TS)
+    assert llm.draft_calls[0]["call"] == "mock"
+
+
+async def test_urgent_message_never_gets_a_call_invitation(tmp_path):
+    repo, sender, kb, llm, svc = await make_triaged(
+        tmp_path, kinds=["win", "feelings"], milestone="sprint_finished", urgent=True,
+    )
+    await svc.handle_buffered("ivan", "сдал третий, но я выгорел в ноль, хочу всё бросить", TS)
+    assert llm.draft_calls[0]["call"] is None and llm.draft_calls[0]["urgent"] is True
 
 
 async def test_legend_ready_allows_offering_the_mock(tmp_path):
@@ -522,6 +541,72 @@ async def test_legend_ready_allows_offering_the_mock(tmp_path):
     )
     await svc.handle_buffered("ivan", "легенду дописал", TS)
     assert llm.draft_calls[0]["call"] == "mock"
+
+
+async def test_milestone_labelled_only_as_status_change_still_gets_a_draft(tmp_path):
+    # модель поставила одну смену этапа — а ровно тут регламент разрешает позвать на собес
+    repo, sender, kb, llm, svc = await make_triaged(
+        tmp_path, kinds=["status_change"], needs_reply=False, milestone="sprint_finished",
+        status=StatusUpdate(new_status="Спринт 4", confidence="high"),
+    )
+    await svc.handle_buffered("ivan", "третий спринт всё", TS)
+    assert llm.draft_calls[0]["call"] == "sprint" and "win" in llm.draft_calls[0]["kinds"]
+    assert sender.mentor_msgs[0][0].startswith("🎉 @ivan:")
+    assert (await repo.get_proposal(1))["new_status"] == "Спринт 4"
+
+
+async def test_win_with_question_header(tmp_path):
+    repo, sender, kb, llm, svc = await make_triaged(tmp_path, kinds=["win", "org_question"])
+    await svc.handle_buffered("ivan", "сдал задачу! а что дальше по резюме?", TS)
+    assert sender.mentor_msgs[0][0].startswith("🎉 @ivan делится успехом и спрашивает:")
+
+
+async def test_mentor_marker_in_draft_is_highlighted(tmp_path):
+    repo, sender, kb, llm, svc = await make_triaged(
+        tmp_path, kinds=["tech_question"],
+        drafts=["Отправитель закрывает. [по этому в материалах нет - допиши сам]"],
+    )
+    await svc.handle_buffered("ivan", "а nil-канал закрыть можно?", TS)
+    assert len(llm.draft_calls) == 1                 # из-за пометки не переписываем: выдумает факты
+    assert "⚠️ проверь: пометка [по этому в материалах нет - допиши сам]" in sender.mentor_msgs[0][0]
+
+
+async def test_long_mentee_text_is_cut_to_fit_telegram(tmp_path):
+    repo, sender, kb, llm, svc = await make_triaged(
+        tmp_path, kinds=["win", "status_change"], milestone="sprint_finished",
+        status=StatusUpdate(new_status="Спринт 4", confidence="high"),
+        drafts=["Красава! " + "Глянул код. " * 100],
+    )
+    text = "сдал третий спринт! вот мой код\n" + "x := <-ch\n" * 300
+    await svc.handle_buffered("ivan", text, TS)
+    shown = sender.mentor_msgs[0][0]
+    assert len(shown) <= 4096 and "…" in shown and "Глянул код. " * 100 in shown
+    [q] = await repo.open_questions()
+    assert q["question"] == text                     # в базе — полный текст
+    assert (await repo.get_proposal(1))["new_status"] == "Спринт 4"
+
+
+class DraftRejectingSender(FakeSender):
+    async def notify_mentor(self, text, reply_markup=None):
+        if "ЧЕРНОВИК" in text:
+            raise RuntimeError("Bad Request: message is too long")
+        await super().notify_mentor(text, reply_markup)
+
+
+async def test_rejected_draft_does_not_cancel_status_proposal(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    sender = DraftRejectingSender()
+    llm = FakeLLM(kinds=["win", "status_change"], milestone="sprint_finished",
+                  status=StatusUpdate(new_status="Спринт 4", confidence="high"))
+    svc = Service(repo, FakeSheets([sm()]), llm, sender, FakeKB(), FakeSettings())
+    await svc.sync_mentees()
+    with pytest.raises(RuntimeError):
+        await svc.handle_buffered("ivan", "сдал третий спринт!", TS)
+    # ментор черновик не видел — открытым он не висит и remind_cycle о нём не напомнит
+    assert await repo.open_questions() == []
+    assert (await repo.get_proposal(1))["new_status"] == "Спринт 4"
+    assert "Сменить статус" in sender.mentor_msgs[0][0]
+    await repo.close()
 
 
 async def test_milestone_alone_still_proposes_status(tmp_path):

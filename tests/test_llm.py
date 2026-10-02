@@ -74,7 +74,7 @@ async def test_draft_for_feelings_has_no_course_materials_and_forbids_calls():
     assert out == "бывает"
     system, user = _draft_prompt(fake)
     assert fake.chat.completions.calls[-1]["model"] == "smart"
-    assert "Материалы курса" not in user and "Вопросов нет" in user
+    assert "материалов курса" not in user and "Материалы не подбирались" in user
     assert "любит, когда по-простому" in user               # заметки ментора дошли
     assert "го глянем, скинь код" in user and "Так пишет ментор" in user
     assert "РЕГЛАМЕНТ СОЗВОНОВ" in system and "созвон НЕ предлагай" in system
@@ -93,11 +93,31 @@ async def test_draft_call_rule_follows_permission_and_avoid_list():
     assert "мок-собеса по легенде" in system
     await llm.draft_reply("как закрыть канал?", ["tech_question"],
                           chunks=[{"text": "close(ch)", "source": "урок «Каналы»"}],
-                          avoid=["предлагает созвон («созвон»)"])
+                          avoid=["упоминает созвон («созвон»)"])
     system, user = _draft_prompt(fake)
     assert "созвон НЕ предлагай" in system
-    assert "[Источник: урок «Каналы»]" in user
-    assert "не прошёл проверку: предлагает созвон" in user
+    assert "[Источник: урок «Каналы»]" in user and "не все по теме" in user
+    assert "не прошёл проверку: упоминает созвон" in user
+
+
+async def test_draft_on_mock_stage_does_not_push_the_mock():
+    fake = FakeClient([PlainText(text="a")])
+    llm = LLM("k", "smart", "fast", "emb", client=fake)
+    await llm.draft_reply("устал, неделя адская", ["feelings"], call="mock_stage")
+    system, _ = _draft_prompt(fake)
+    assert "мок не пристёгивай" in system
+    # день и время мок-собеса — по расписанию ментора, модель его не знает
+    assert "день и время сам не называй" in system.lower()
+
+
+async def test_draft_prompt_guards_mentor_promises_and_requested_calls():
+    fake = FakeClient([PlainText(text="a")])
+    llm = LLM("k", "smart", "fast", "emb", client=fake)
+    await llm.draft_reply("можем созвониться? не догоняю интерфейсы", ["tech_question"], chunks=[])
+    system, _ = _draft_prompt(fake)
+    assert "[просит созвон - реши сам]" in system and "[срок - допиши сам]" in system
+    assert "Повторный мок" in system
+    assert "называй «собес»" in system
 
 
 async def test_gen_ping_gets_style_samples_and_call_ban():
@@ -109,6 +129,16 @@ async def test_gen_ping_gets_style_samples_and_call_ban():
     assert "ну чё, как каналы?" in user
     assert "созвоны" in system.split("ЗАПРЕЩЕНО")[1].split("\n")[0]
     assert "ЧТОБЫ НЕ ЗВУЧАТЬ КАК НЕЙРОСЕТЬ" in system
+
+
+async def test_gen_ping_asks_to_call_company_interviews_sobes_only_where_relevant():
+    fake = FakeClient([PlainText(text="как собесы?"), PlainText(text="как спринт?")])
+    llm = LLM("k", "smart", "fast", "emb", client=fake)
+    await llm.gen_ping("Иван @ivan", "Собесы", [], None)
+    await llm.gen_ping("Иван @ivan", "Спринт 2", [], None)
+    market, sprint = (c["messages"][0]["content"] for c in fake.chat.completions.calls)
+    assert "называй «собес»" in market
+    assert "называй «собес»" not in sprint     # на спринтах само слово подтолкнуло бы к собесам
 
 
 async def test_gen_ping_injects_stage_gate():

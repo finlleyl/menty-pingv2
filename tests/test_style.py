@@ -1,6 +1,6 @@
 import pytest
 
-from mentor_bot.style import ai_tells, call_hits, draft_problems, normalize_dashes
+from mentor_bot.style import ai_tells, call_hits, draft_problems, normalize_dashes, todo_marks
 
 
 @pytest.mark.parametrize("text", [
@@ -26,6 +26,19 @@ from mentor_bot.style import ai_tells, call_hits, draft_problems, normalize_dash
     "Набери, обсудим по звонку",
     "Скину ссылку на телемосте",
     "Давай созвонимся с тобой в четверг",
+    # синонимы, которыми модель заменяет запрещённое слово при переписке
+    "Давай я тебе наберу",
+    "Набери меня вечером",
+    "Давай наберу тебя вечером",
+    "обсудим по видео",
+    "Обсудим по видео?",
+    "Скинь ссылку на гугл мит",
+    "Можем вживую разобрать, расшарю экран",
+    "Давай в войсе обсудим",
+    # повторный мок и «пробный собес» — тоже созвон вне регламента
+    "Давай прогоним ещё один мок по алгоритмам",
+    "Давай устроим пробный собес в четверг",
+    "Можем потренироваться вместе перед собесом",
 ])
 def test_call_hits_catches_call_offers(text):
     assert call_hits(text), text
@@ -47,6 +60,19 @@ def test_call_hits_catches_call_offers(text):
     "Как прошёл созвон с HR?",
     "Перед созвоном с тимлидом повтори каналы",
     "На встрече с работодателем спросят про опыт",
+    "Жду, когда будет звонок от рекрутера",
+    # третье лицо и прошедшее — рассказ о чужом звонке, а не предложение созвониться
+    "Рекрутеры звонят?",
+    "Если тебе позвонят из Тинькофф, спроси про вилку",
+    "Когда позвонит рекрутер, спроси про вилку",
+    "Метод Call у интерфейса принимает контекст",
+    "Набери go env в терминале",
+    "По видео из урока про каналы всё понятно?",
+    # mock-объект из тестов — это не мок-собес
+    "Сделай мок для репозитория и прогони тесты с моком",
+    "После легенды будет мок-собес",
+    # пометка ментору — вопрос ему, а не предложение созвона ученику
+    "Скинь код, на чём встал. [просит созвон - реши сам]",
 ])
 def test_call_hits_ignores_lookalikes(text):
     assert call_hits(text) == [], text
@@ -68,6 +94,40 @@ def test_ai_tells_therapist_mirroring_and_triple_cheer():
     cheer = ai_tells("Молодец! Так держать! Всё получится!", ["win"])
     assert any("три восклицания" in t for t in cheer)
     assert not any("три восклицания" in t for t in ai_tells("Красава!!! Го дальше", ["win"]))
+    # «!=» в Go-коде без бэктиков — не восклицания
+    code = "Проверь if err != nil, потом ok != true, и если v != nil - паника"
+    assert ai_tells(code, ["tech_question"]) == []
+
+
+def test_mentor_own_loud_style_is_not_a_cliche():
+    loud = "Красава! Поздравляю! Теперь резюме, я займусь! 🔥🔥🔥"
+    assert ai_tells(loud, ["win"], samples=["го дальше"]) == [
+        "эмодзи пачкой", "три восклицания: «Молодец! Так держать! Всё получится!»",
+    ]
+    # ментор сам так пишет — копировать его пунктуацию и эмодзи и просили
+    assert ai_tells(loud, ["win"], samples=["Огонь! Красава! 🚀🚀"]) == []
+
+
+@pytest.mark.parametrize("text, label", [
+    ("Это абсолютно нормально, все через это проходят.", "«абсолютно нормально»"),
+    ("Ты справишься!", "«ты справишься»"),
+    ("Ты на правильном пути, не сдавайся", "«ты справишься»"),
+    ("Помни, ты не один", "«ты справишься»"),
+    ("Понимаю тебя. Сам так сидел", "«понимаю тебя»"),
+    ("Понимаю. Бывает", "«понимаю тебя»"),
+    ("Отличная работа", "«отличная работа»"),
+    ("Ты проделал огромную работу", "«отличная работа»"),
+    ("Так держать", "«отличная работа»"),
+    ("Горжусь тобой", "«отличная работа»"),
+])
+def test_ai_tells_catches_consolation_cliches(text, label):
+    assert label in ai_tells(text, ["feelings"]), text
+
+
+def test_consolation_lookalikes_are_not_cliches():
+    assert ai_tells("Код отлично работает, гоняй тесты", ["tech_question"]) == []
+    assert ai_tells("Ты не один такой, на каналах все тупят", ["feelings"]) == []
+    assert ai_tells("Не понимаю тебя, что за ошибка? Скинь текст", ["tech_question"]) == []
 
 
 def test_bullets_flagged_only_outside_technical_replies():
@@ -105,6 +165,15 @@ def test_dashes_kept_when_mentor_uses_them_or_unknown():
 
 def test_draft_problems_respects_call_permission():
     text = "Красава! Давай созвонимся на неделе и проведём собес по спринту"
-    assert draft_problems(text, ["win"], call=None)[0].startswith("предлагает созвон")
+    assert draft_problems(text, ["win"], call=None)[0].startswith("упоминает созвон")
     assert draft_problems(text, ["win"], call="sprint") == []
     assert draft_problems(text, ["win"], call="mock") == []
+
+
+def test_todo_marks_found_and_invisible_to_lint():
+    text = ("Каналы закрывает отправитель. [по этому в материалах нет — допиши сам]\n"
+            "Скинь, на чём встал. [просит созвон - реши сам]")
+    assert todo_marks(text) == ["[по этому в материалах нет — допиши сам]",
+                                "[просит созвон - реши сам]"]
+    assert todo_marks("Скинь код, гляну [вот сюда]") == []
+    assert draft_problems(text, ["tech_question"], call=None) == []

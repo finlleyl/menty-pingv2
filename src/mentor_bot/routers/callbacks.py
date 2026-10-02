@@ -5,6 +5,7 @@ from aiogram import F, Router
 from aiogram.types import CallbackQuery
 
 from mentor_bot.sheets import RowNotFound, StatusConflict
+from mentor_bot.style import todo_marks
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +31,11 @@ async def handle_q_callback(data: str, repo, sender, service) -> str:
         )
         return "Жду текст"
     if action == "send":
+        # «[по этому в материалах нет - допиши сам]» с аккаунта ментора — хуже любого штампа
+        marks = todo_marks(q["draft"])
+        if marks:
+            # ответ на нажатие — всплывашка до 200 символов
+            return f"В черновике осталась пометка {marks[0][:120]} - нажми ✏️ Править"
         if not await repo.claim("questions", q["id"]):
             return "Уже обработано"   # второе быстрое нажатие
         try:

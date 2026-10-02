@@ -229,12 +229,17 @@ class Repo:
     async def style_samples(self, limit=10, per_user=2, scan=400):
         """Настоящие сообщения ментора ученикам — образец тона для модели.
 
+        Только ученикам из таблицы: Business-подключение видит все личные чаты, и переписка
+        с незнакомым чатом пишется в messages, пока ментор не нажал «Не менти» (у таких
+        sheet_title пуст). Личным сообщениям ментора не место ни в промпте, ни у провайдера.
         Пинги, которые отправил бот, и черновики, ушедшие как есть, — это текст модели, а не
         ментора: учиться на них — значит закреплять ту самую «нейронистость». Не больше
         per_user на ученика, чтобы один длинный диалог не задавал тон за всех."""
+        from mentor_bot.style import call_hits
         rows = await self._all(
             "SELECT m.username, m.text FROM messages m "
             "WHERE m.direction='out' AND m.text != '[медиа]' AND length(m.text) BETWEEN ? AND ? "
+            "AND m.username IN (SELECT username FROM mentees WHERE sheet_title IS NOT NULL) "
             "AND NOT EXISTS (SELECT 1 FROM pings p WHERE p.username=m.username "
             "AND p.ts=m.ts AND p.status='sent') "
             "AND NOT EXISTS (SELECT 1 FROM questions q WHERE q.draft=m.text) "
@@ -246,6 +251,10 @@ class Repo:
             key = " ".join(r["text"].lower().split())
             if key in seen or per.get(r["username"], 0) >= per_user:
                 continue
+            # «го созвон в 8 по спринту?» — законно по регламенту, но с пометкой «копируй
+            # лексику» модель начнёт звать на созвон в каждом черновике и пинге
+            if call_hits(r["text"]):
+                continue
             seen.add(key)
             per[r["username"]] = per.get(r["username"], 0) + 1
             out.append(r["text"].strip())
@@ -254,10 +263,15 @@ class Repo:
         return out
 
     async def answered_questions(self, limit=500):
-        """Вопросы с настоящим ответом ментора и эмбеддингом вопроса — для поиска похожих."""
+        """Вопросы с настоящим ответом ментора и эмбеддингом вопроса — для поиска похожих.
+
+        Технический черновик, отправленный как есть, — ответ, который ментор проверил: факты
+        в нём годятся. А тёплый ответ без правки — это тон модели, и подсовывать его как
+        «так ответил ментор» значит учить нейронку на самой себе (как и в style_samples)."""
         rows = await self._all(
             "SELECT question, final, emb FROM questions "
-            "WHERE final IS NOT NULL AND emb IS NOT NULL ORDER BY id DESC LIMIT ?",
+            "WHERE final IS NOT NULL AND emb IS NOT NULL "
+            f"AND (kind != '{KIND_HUMAN}' OR final != draft) ORDER BY id DESC LIMIT ?",
             (limit,),
         )
         for r in rows:

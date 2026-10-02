@@ -98,7 +98,7 @@ async def ping_cycle(service, repo, sender, llm, settings, now_utc: datetime | N
             text = await llm.gen_ping(m.display, m.status, recent, profile, m.notes,
                                       samples=samples)
             hits = forbidden_hits(text, stage)
-            tells = ai_tells(text)
+            tells = ai_tells(text, samples=samples)
             if hits or tells:
                 log.warning("ping for %s touched %s, regenerating", username, hits + tells)
                 text = await llm.gen_ping(m.display, m.status, recent, profile, m.notes,

@@ -140,8 +140,14 @@ async def test_backup_with_uncommitted_write(tmp_path):
     await repo.close()
 
 
+async def _sheet_mentees(repo, *names):
+    for n in names:
+        await repo.upsert_mentee(n, sheet_title="A", row=2)
+
+
 async def test_style_samples_are_real_mentor_messages(tmp_path):
     repo = await Repo.open(str(tmp_path / "t.db"))
+    await _sheet_mentees(repo, "ivan", "petr")
     ts = iter(f"2026-09-01T10:{i:02d}:00+00:00" for i in range(60))
     await repo.log_message("ivan", "out", "скинь код, гляну вечером", next(ts))
     await repo.log_message("ivan", "out", "ок", next(ts))                         # слишком коротко
@@ -165,6 +171,7 @@ async def test_style_samples_are_real_mentor_messages(tmp_path):
 
 async def test_style_samples_cap_per_mentee_and_total(tmp_path):
     repo = await Repo.open(str(tmp_path / "t.db"))
+    await _sheet_mentees(repo, "ivan", "petr")
     for i in range(5):
         await repo.log_message("ivan", "out", f"ответ ивану номер {i}", f"2026-09-01T10:0{i}:00+00:00")
     for i in range(5):
@@ -172,6 +179,43 @@ async def test_style_samples_cap_per_mentee_and_total(tmp_path):
     got = await repo.style_samples(limit=3, per_user=2)
     # свежие первыми, но не больше двух на ученика — тон не задаёт один длинный диалог
     assert got == ["ответ ивану номер 4", "ответ ивану номер 3", "ответ пете номер 4"]
+    await repo.close()
+
+
+async def test_style_samples_skip_non_mentee_chats_and_call_scheduling(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    await _sheet_mentees(repo, "ivan")
+    # чат, который бот увидел через Business, но в таблицу его не добавили (друг, семья)
+    await repo.upsert_mentee("mama", chat_id=7)
+    await repo.log_message("mama", "out", "купи хлеба по дороге, пожалуйста", "2026-09-01T10:00:00+00:00")
+    await repo.log_message("friend", "out", "го в субботу на шашлыки", "2026-09-01T10:01:00+00:00")
+    # законно по регламенту, но как образец тона учил бы звать на созвон всех подряд
+    await repo.log_message("ivan", "out", "созвонимся в 19 по спринту?", "2026-09-01T10:02:00+00:00")
+    await repo.log_message("ivan", "out", "скинь код, гляну вечером", "2026-09-01T10:03:00+00:00")
+    assert await repo.style_samples() == ["скинь код, гляну вечером"]
+    await repo.close()
+
+
+async def test_style_samples_query_uses_indexes(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    names = {r["name"] for r in await repo._all("SELECT name FROM sqlite_master WHERE type='index'")}
+    # без них запрос образцов на каждый черновик рос квадратично с историей переписки
+    assert {"idx_pings_user_ts", "idx_questions_draft"} <= names
+    await repo.close()
+
+
+async def test_similar_answers_skip_unedited_human_drafts(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    ts = "2026-09-01T10:00:00+00:00"
+    tech = await repo.add_question("ivan", "как закрыть канал?", "close(ch) у отправителя", ts, emb=[1.0])
+    await repo.set_question_final(tech, "close(ch) у отправителя")        # проверено ментором как есть
+    warm = await repo.add_question("ivan", "устал", "Бывает, отдохни", ts, emb=[1.0], kind="human")
+    await repo.set_question_final(warm, "Бывает, отдохни")                # тон модели, не ментора
+    edited = await repo.add_question("petr", "выгорел", "Отдохни", ts, emb=[1.0], kind="human")
+    await repo.set_question_final(edited, "да забей на вечер, завтра добьём")
+    assert {r["final"] for r in await repo.answered_questions()} == {
+        "close(ch) у отправителя", "да забей на вечер, завтра добьём",
+    }
     await repo.close()
 
 
