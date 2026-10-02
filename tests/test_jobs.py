@@ -48,7 +48,7 @@ async def make(tmp_path, mentees=None):
     llm = FakeLLM()
     calls = []
 
-    async def gen_ping(display, status, recent, profile, notes=None):
+    async def gen_ping(display, status, recent, profile, notes=None, avoid=None, samples=None):
         calls.append(display)
         return f"ПИНГ[{display}]"
 
@@ -304,7 +304,7 @@ async def test_forbidden_topic_triggers_regeneration(tmp_path):
     await repo.set_setting("bconn", "conn1")
     seen_avoid = []
 
-    async def gen_ping(display, status, recent, profile, notes=None, avoid=None):
+    async def gen_ping(display, status, recent, profile, notes=None, avoid=None, samples=None):
         seen_avoid.append(avoid)
         return "Как спринт? Резюме уже набросал?" if avoid is None else "Как спринт, где застрял?"
 
@@ -378,3 +378,78 @@ async def test_edited_ping_is_sent(tmp_path):
     assert "отправлен" in out
     assert sender.mentee_msgs == [("ivan", "Ну что, как третий спринт?")]
     assert (await repo.get_ping_draft(pid))["state"] == "sent"
+
+
+async def _live(repo):
+    await repo.upsert_mentee("ivan", chat_id=1)
+    await repo.set_setting("dryrun", "0")
+    await repo.set_setting("bconn", "conn1")
+
+
+async def test_call_offer_in_ping_is_rewritten(tmp_path):
+    repo, sheets, sender, llm, svc = await make(tmp_path)
+    await _live(repo)
+    seen = []
+
+    async def gen_ping(display, status, recent, profile, notes=None, avoid=None, samples=None):
+        seen.append(avoid)
+        return "Где застрял? Давай созвонимся" if avoid is None else "Где застрял? Скинь, что не идёт"
+
+    llm.gen_ping = gen_ping
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC)
+    assert seen == [None, ["созвоны"]]
+    assert sender.mentee_msgs == [("ivan", "Где застрял? Скинь, что не идёт")]
+
+
+async def test_repeated_call_offer_in_ping_goes_to_review(tmp_path):
+    repo, sheets, sender, llm, svc = await make(tmp_path)
+    await _live(repo)
+
+    async def gen_ping(*a, **kw):
+        return "Может, в зум на полчаса?"
+
+    llm.gen_ping = gen_ping
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC)
+    assert sender.mentee_msgs == []
+    assert "созвоны" in sender.mentor_msgs[-1][0]
+
+
+async def test_mock_ping_may_ask_about_the_mock_call(tmp_path):
+    repo, sheets, sender, llm, svc = await make(tmp_path, mentees=[sm(status="Мок")])
+    await _live(repo)
+    seen = []
+
+    async def gen_ping(display, status, recent, profile, notes=None, avoid=None, samples=None):
+        seen.append(avoid)
+        return "Когда удобно созвониться на мок?"
+
+    llm.gen_ping = gen_ping
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC)
+    assert seen == [None]                                    # по регламенту — переписывать нечего
+    assert sender.mentee_msgs == [("ivan", "Когда удобно созвониться на мок?")]
+
+
+async def test_ping_cliches_are_rewritten_but_never_block_sending(tmp_path):
+    repo, sheets, sender, llm, svc = await make(tmp_path)
+    await _live(repo)
+    await repo.log_message("ivan", "out", "ну чё, как каналы - разобрался?", "2026-08-10T10:00:00+00:00")
+    seen = []
+
+    async def gen_ping(display, status, recent, profile, notes=None, avoid=None, samples=None):
+        seen.append((avoid, samples))
+        return "Не стесняйся писать — как спринт?"
+
+    llm.gen_ping = gen_ping
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC)
+    assert seen[0] == (None, ["ну чё, как каналы - разобрался?"])     # образцы стиля ментора
+    assert seen[1][0] == ["«не стесняйся/обращайся»"]
+    # штамп остался, но это не запретная тема: пинг уходит, тире приведено к стилю ментора
+    assert sender.mentee_msgs == [("ivan", "Не стесняйся писать - как спринт?")]
+    assert await repo.open_ping_draft("ivan") is None
+
+
+async def test_remind_cycle_wording_for_human_drafts(tmp_path):
+    repo, sheets, sender, llm, svc = await make(tmp_path)
+    await repo.add_question("ivan", "выгорел", "бывает", "2026-08-20T05:00:00+00:00", kind="human")
+    await remind_cycle(repo, sender, now_utc=NOON_UTC)
+    assert sender.mentor_msgs[0][0].startswith("⏰ Висит без ответа сообщение от @ivan")

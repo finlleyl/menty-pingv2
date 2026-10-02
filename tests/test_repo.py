@@ -138,3 +138,73 @@ async def test_backup_with_uncommitted_write(tmp_path):
     await repo.backup_to(str(tmp_path / "copy.db"))
     assert (tmp_path / "copy.db").exists()
     await repo.close()
+
+
+async def test_style_samples_are_real_mentor_messages(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    ts = iter(f"2026-09-01T10:{i:02d}:00+00:00" for i in range(60))
+    await repo.log_message("ivan", "out", "скинь код, гляну вечером", next(ts))
+    await repo.log_message("ivan", "out", "ок", next(ts))                         # слишком коротко
+    await repo.log_message("ivan", "out", "[медиа]", next(ts))
+    await repo.log_message("ivan", "out", "х" * 700, next(ts))                     # простыня
+    await repo.log_message("ivan", "in", "а как закрыть канал правильно?", next(ts))   # не ментор
+    # пинг, который отправил бот, — текст модели: в образцы не идёт
+    ping_ts = next(ts)
+    await repo.log_ping("ivan", ping_ts, "sent")
+    await repo.log_message("ivan", "out", "Как там спринт, где застрял?", ping_ts)
+    # черновик, ушедший как есть, — тоже текст модели
+    await repo.add_question("ivan", "вопрос", "Канал закрывает отправитель, не получатель", next(ts))
+    await repo.log_message("ivan", "out", "Канал закрывает отправитель, не получатель", next(ts))
+    await repo.log_message("petr", "out", "Скинь код, гляну вечером", next(ts))     # дубль другим регистром
+    await repo.log_message("petr", "out", "красава, го дальше по плану", next(ts))
+    assert await repo.style_samples() == [
+        "красава, го дальше по плану", "Скинь код, гляну вечером",
+    ]
+    await repo.close()
+
+
+async def test_style_samples_cap_per_mentee_and_total(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    for i in range(5):
+        await repo.log_message("ivan", "out", f"ответ ивану номер {i}", f"2026-09-01T10:0{i}:00+00:00")
+    for i in range(5):
+        await repo.log_message("petr", "out", f"ответ пете номер {i}", f"2026-09-01T09:0{i}:00+00:00")
+    got = await repo.style_samples(limit=3, per_user=2)
+    # свежие первыми, но не больше двух на ученика — тон не задаёт один длинный диалог
+    assert got == ["ответ ивану номер 4", "ответ ивану номер 3", "ответ пете номер 4"]
+    await repo.close()
+
+
+async def test_question_kind_migrates_on_old_database(tmp_path):
+    import aiosqlite
+
+    path = str(tmp_path / "old.db")
+    # таблица questions в том виде, в каком она жила до разбора эмоций (ещё и без final/emb)
+    conn = await aiosqlite.connect(path)
+    await conn.execute(
+        "CREATE TABLE questions(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL, "
+        "question TEXT NOT NULL, draft TEXT NOT NULL, created_ts TEXT NOT NULL, "
+        "state TEXT NOT NULL DEFAULT 'open', reminded INTEGER NOT NULL DEFAULT 0)"
+    )
+    await conn.execute(
+        "INSERT INTO questions(username, question, draft, created_ts) "
+        "VALUES ('ivan', 'как закрыть канал?', 'черновик', '2026-08-01T10:00:00+00:00')"
+    )
+    await conn.commit()
+    await conn.close()
+
+    repo = await Repo.open(path)
+    old = await repo.get_question(1)
+    assert old["kind"] == "question" and old["final"] is None    # старый черновик — ответ на вопрос
+    await repo.set_question_final(1, "закрывает отправитель")
+    hid = await repo.add_question("ivan", "устал", "бывает", "2026-08-02T10:00:00+00:00", kind="human")
+    await repo.set_question_final(hid, "отдохни денёк, потом добьём")
+    # правки не смешиваются: тёплые ответы не учат отвечать про каналы и наоборот
+    assert [e["final"] for e in await repo.edit_examples(kind="question")] == ["закрывает отправитель"]
+    assert [e["final"] for e in await repo.edit_examples(kind="human")] == ["отдохни денёк, потом добьём"]
+    assert len(await repo.edit_examples()) == 2
+    await repo.close()
+    # повторное открытие не пытается добавить колонку второй раз
+    repo = await Repo.open(path)
+    assert (await repo.get_question(hid))["kind"] == "human"
+    await repo.close()

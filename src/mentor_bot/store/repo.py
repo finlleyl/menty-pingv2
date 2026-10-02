@@ -9,6 +9,16 @@ from .db import SCHEMA
 MIN_ANSWER_CHARS = 40       # короче — «ок, щас гляну», а не ответ
 ANSWER_WINDOW_HOURS = 6     # сколько после вопроса ждём настоящего ответа ментора
 
+# questions.kind — группа черновика. 'question' — в сообщении есть вопрос (технический или
+# организационный), ответ опирается на материалы; 'human' — только переживания или успех.
+# Группы не смешиваем в примерах правок: правка тёплого ответа не учит отвечать про каналы.
+KIND_QUESTION = "question"
+KIND_HUMAN = "human"
+
+# Образцы стиля ментора: короче — «ок», длиннее — простыня, по которой тон не поймать
+STYLE_MIN_CHARS = 15
+STYLE_MAX_CHARS = 600
+
 
 class Repo:
     def __init__(self, conn: aiosqlite.Connection):
@@ -27,13 +37,16 @@ class Repo:
     @staticmethod
     async def _migrate(conn):
         """Догоняем схему на базах, созданных прошлыми версиями."""
-        for table, col in (
-            ("mentees", "status_since"), ("mentees", "last_status"),
-            ("proposals", "from_status"), ("questions", "final"), ("questions", "emb"),
+        for table, col, decl in (
+            ("mentees", "status_since", "TEXT"), ("mentees", "last_status", "TEXT"),
+            ("proposals", "from_status", "TEXT"), ("questions", "final", "TEXT"),
+            ("questions", "emb", "TEXT"),
+            # до разбора эмоций все черновики были ответами на вопросы — отсюда и DEFAULT
+            ("questions", "kind", f"TEXT NOT NULL DEFAULT '{KIND_QUESTION}'"),
         ):
             cur = await conn.execute(f"PRAGMA table_info({table})")
             if col not in {row[1] for row in await cur.fetchall()}:
-                await conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+                await conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
 
     async def close(self):
         await self._c.close()
@@ -168,10 +181,13 @@ class Repo:
         return row["ts"] if row else None
 
     # questions
-    async def add_question(self, username, question, draft, ts_iso, emb=None) -> int:
+    async def add_question(self, username, question, draft, ts_iso, emb=None,
+                           kind=KIND_QUESTION) -> int:
         cur = await self._c.execute(
-            "INSERT INTO questions(username, question, draft, created_ts, emb) VALUES (?,?,?,?,?)",
-            (username, question, draft, ts_iso, json.dumps(emb) if emb is not None else None),
+            "INSERT INTO questions(username, question, draft, created_ts, emb, kind) "
+            "VALUES (?,?,?,?,?,?)",
+            (username, question, draft, ts_iso, json.dumps(emb) if emb is not None else None,
+             kind),
         )
         await self._c.commit()
         return cur.lastrowid
@@ -200,13 +216,42 @@ class Repo:
             (text, username, since),
         )
 
-    async def edit_examples(self, limit=5):
-        """Последние случаи, когда ментор ответил не так, как предлагал черновик."""
-        return await self._all(
-            "SELECT question, draft, final FROM questions "
-            "WHERE final IS NOT NULL AND final != draft ORDER BY id DESC LIMIT ?",
-            (limit,),
+    async def edit_examples(self, limit=5, kind=None):
+        """Последние случаи, когда ментор ответил не так, как предлагал черновик.
+        kind — только из этой группы черновиков (None — из всех)."""
+        sql = "SELECT question, draft, final FROM questions WHERE final IS NOT NULL AND final != draft"
+        args: tuple = ()
+        if kind is not None:
+            sql += " AND kind=?"
+            args = (kind,)
+        return await self._all(sql + " ORDER BY id DESC LIMIT ?", args + (limit,))
+
+    async def style_samples(self, limit=10, per_user=2, scan=400):
+        """Настоящие сообщения ментора ученикам — образец тона для модели.
+
+        Пинги, которые отправил бот, и черновики, ушедшие как есть, — это текст модели, а не
+        ментора: учиться на них — значит закреплять ту самую «нейронистость». Не больше
+        per_user на ученика, чтобы один длинный диалог не задавал тон за всех."""
+        rows = await self._all(
+            "SELECT m.username, m.text FROM messages m "
+            "WHERE m.direction='out' AND m.text != '[медиа]' AND length(m.text) BETWEEN ? AND ? "
+            "AND NOT EXISTS (SELECT 1 FROM pings p WHERE p.username=m.username "
+            "AND p.ts=m.ts AND p.status='sent') "
+            "AND NOT EXISTS (SELECT 1 FROM questions q WHERE q.draft=m.text) "
+            "ORDER BY m.ts DESC, m.id DESC LIMIT ?",
+            (STYLE_MIN_CHARS, STYLE_MAX_CHARS, scan),
         )
+        out, seen, per = [], set(), {}
+        for r in rows:
+            key = " ".join(r["text"].lower().split())
+            if key in seen or per.get(r["username"], 0) >= per_user:
+                continue
+            seen.add(key)
+            per[r["username"]] = per.get(r["username"], 0) + 1
+            out.append(r["text"].strip())
+            if len(out) >= limit:
+                break
+        return out
 
     async def answered_questions(self, limit=500):
         """Вопросы с настоящим ответом ментора и эмбеддингом вопроса — для поиска похожих."""

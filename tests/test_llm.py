@@ -1,4 +1,7 @@
-from mentor_bot.llm import LLM, Classification, PlainText, StatusUpdate
+from mentor_bot.llm import LLM, PlainText, StatusUpdate, Triage
+
+SMALLTALK = Triage(kinds=["smalltalk"], needs_reply=False, urgent=False, milestone="none")
+TECH = Triage(kinds=["tech_question"], needs_reply=True, urgent=False, milestone="none")
 
 
 class FakeCompletions:
@@ -32,17 +35,80 @@ class FakeClient:
         self.chat = FakeChat(payloads)
 
 
-async def test_classify_and_status():
+async def test_triage_and_status():
     fake = FakeClient([
-        Classification(kind="question"),
+        TECH,
         StatusUpdate(new_status="Собесы", confidence="high"),
     ])
     llm = LLM("k", "smart", "fast", "emb", client=fake)
-    assert await llm.classify("а как работает select?") == "question"
+    tri = await llm.triage("а как работает select?",
+                           [{"direction": "out", "text": "как спринт?"}], "3 спринт")
+    assert tri.kinds == ["tech_question"] and tri.needs_reply
     upd = await llm.parse_status("прошел мок, вышел на рынок", "3 спринт")
     assert upd.new_status == "Собесы" and upd.confidence == "high"
-    # классификация должна идти на быстрой модели
-    assert fake.chat.completions.calls[0]["model"] == "fast"
+    # разбор должен идти на быстрой модели
+    call = fake.chat.completions.calls[0]
+    assert call["model"] == "fast"
+    # сортировщик видит прошлую переписку и статус, а новые сообщения — отдельно
+    user = call["messages"][1]["content"]
+    assert "Ментор: как спринт?" in user and "«3 спринт»" in user
+    assert user.rstrip().endswith("а как работает select?")
+    system = call["messages"][0]["content"]
+    for label in ("tech_question", "org_question", "feelings", "win", "status_change", "smalltalk",
+                  "sprint_finished", "legend_ready", "urgent"):
+        assert label in system
+
+
+def _draft_prompt(fake):
+    call = fake.chat.completions.calls[-1]
+    return call["messages"][0]["content"], call["messages"][1]["content"]
+
+
+async def test_draft_for_feelings_has_no_course_materials_and_forbids_calls():
+    fake = FakeClient([PlainText(text="бывает")])
+    llm = LLM("k", "smart", "fast", "emb", client=fake)
+    out = await llm.draft_reply(
+        "чёт совсем руки опустились", ["feelings"], recent=[], stage_label="3-й спринт обучения",
+        status="Спринт 3", notes="любит, когда по-простому", samples=["го глянем, скинь код"],
+    )
+    assert out == "бывает"
+    system, user = _draft_prompt(fake)
+    assert fake.chat.completions.calls[-1]["model"] == "smart"
+    assert "Материалы курса" not in user and "Вопросов нет" in user
+    assert "любит, когда по-простому" in user               # заметки ментора дошли
+    assert "го глянем, скинь код" in user and "Так пишет ментор" in user
+    assert "РЕГЛАМЕНТ СОЗВОНОВ" in system and "созвон НЕ предлагай" in system
+    assert "«Не переживай»" in system                       # список штампов на месте
+    assert "Привет" not in system.split("ЧТОБЫ НЕ ЗВУЧАТЬ")[0]   # диалог не идёт — не запрещаем
+
+
+async def test_draft_call_rule_follows_permission_and_avoid_list():
+    fake = FakeClient([PlainText(text="a"), PlainText(text="b"), PlainText(text="c")])
+    llm = LLM("k", "smart", "fast", "emb", client=fake)
+    await llm.draft_reply("сдал 2 спринт!", ["win"], call="sprint", ongoing=True)
+    system, _ = _draft_prompt(fake)
+    assert "собеседования по спринту" in system and "не начинай с «Привет»" in system
+    await llm.draft_reply("легенда готова", ["win"], call="mock")
+    system, _ = _draft_prompt(fake)
+    assert "мок-собеса по легенде" in system
+    await llm.draft_reply("как закрыть канал?", ["tech_question"],
+                          chunks=[{"text": "close(ch)", "source": "урок «Каналы»"}],
+                          avoid=["предлагает созвон («созвон»)"])
+    system, user = _draft_prompt(fake)
+    assert "созвон НЕ предлагай" in system
+    assert "[Источник: урок «Каналы»]" in user
+    assert "не прошёл проверку: предлагает созвон" in user
+
+
+async def test_gen_ping_gets_style_samples_and_call_ban():
+    fake = FakeClient([PlainText(text="как оно?")])
+    llm = LLM("k", "smart", "fast", "emb", client=fake)
+    await llm.gen_ping("Иван @ivan", "Спринт 2", [], None, samples=["ну чё, как каналы?"])
+    system = fake.chat.completions.calls[0]["messages"][0]["content"]
+    user = fake.chat.completions.calls[0]["messages"][1]["content"]
+    assert "ну чё, как каналы?" in user
+    assert "созвоны" in system.split("ЗАПРЕЩЕНО")[1].split("\n")[0]
+    assert "ЧТОБЫ НЕ ЗВУЧАТЬ КАК НЕЙРОСЕТЬ" in system
 
 
 async def test_gen_ping_injects_stage_gate():
@@ -137,18 +203,18 @@ def _raising_llm(exc):
 
 
 async def test_openrouter_requires_hosts_that_support_the_schema():
-    fake = FakeClient([Classification(kind="other")])
+    fake = FakeClient([SMALLTALK])
     llm = LLM("k", "smart", "fast", "emb", client=fake, base_url="https://openrouter.ai/api/v1")
-    await llm.classify("спасибо")
+    await llm.triage("спасибо")
     assert fake.chat.completions.calls[0]["extra_body"] == {
         "provider": {"require_parameters": True}, "usage": {"include": True},
     }
 
 
 async def test_direct_provider_gets_no_openrouter_routing():
-    fake = FakeClient([Classification(kind="other")])
+    fake = FakeClient([SMALLTALK])
     llm = LLM("k", "smart", "fast", "emb", client=fake)
-    await llm.classify("спасибо")
+    await llm.triage("спасибо")
     assert fake.chat.completions.calls[0]["extra_body"] is None
 
 
@@ -161,7 +227,7 @@ async def test_direct_provider_gets_no_openrouter_routing():
 ])
 async def test_provider_outage_becomes_llm_unavailable(exc):
     with pytest.raises(LLMUnavailable):
-        await _raising_llm(exc).classify("спасибо")
+        await _raising_llm(exc).triage("спасибо")
 
 
 @pytest.mark.parametrize("exc", [
@@ -170,11 +236,11 @@ async def test_provider_outage_becomes_llm_unavailable(exc):
 ])
 async def test_request_specific_errors_propagate_as_is(exc):
     with pytest.raises(type(exc)):
-        await _raising_llm(exc).classify("спасибо")
+        await _raising_llm(exc).triage("спасибо")
 
 
 async def test_usage_is_recorded_per_task():
-    fake = FakeClient([Classification(kind="other")])
+    fake = FakeClient([SMALLTALK])
     seen = []
 
     async def sink(ts, task, model, pt, ct, cost):
@@ -192,12 +258,12 @@ async def test_usage_is_recorded_per_task():
 
     fake.chat.completions.parse = parse_with_usage
     llm = LLM("k", "smart", "fast", "emb", client=fake, usage_sink=sink)
-    await llm.classify("спасибо")
-    assert seen == [("classify", "fast", 120, 5, 0.0003)]
+    await llm.triage("спасибо")
+    assert seen == [("triage", "fast", 120, 5, 0.0003)]
 
 
 async def test_broken_usage_sink_does_not_break_request():
-    fake = FakeClient([Classification(kind="question")])
+    fake = FakeClient([TECH])
 
     async def sink(*a):
         raise RuntimeError("db locked")
@@ -215,4 +281,4 @@ async def test_broken_usage_sink_does_not_break_request():
         return resp
 
     fake.chat.completions.parse = parse_with_usage
-    assert await llm.classify("а как?") == "question"
+    assert (await llm.triage("а как?")).kinds == ["tech_question"]

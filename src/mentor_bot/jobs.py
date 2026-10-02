@@ -20,6 +20,8 @@ from mentor_bot.pings import (
     should_ping,
 )
 from mentor_bot.stages import STAGE_LABELS, forbidden_hits, parse_stage
+from mentor_bot.store.repo import KIND_HUMAN
+from mentor_bot.style import ai_tells, normalize_dashes
 
 log = logging.getLogger(__name__)
 
@@ -39,6 +41,7 @@ async def ping_cycle(service, repo, sender, llm, settings, now_utc: datetime | N
         return
 
     errors = 0
+    samples = None
     items = list(service.by_username.items())
     random.shuffle(items)
     for username, m in items:
@@ -90,12 +93,20 @@ async def ping_cycle(service, repo, sender, llm, settings, now_utc: datetime | N
         try:
             recent = await repo.recent_messages(username, limit=10)
             profile = await repo.get_profile(username)
-            text = await llm.gen_ping(m.display, m.status, recent, profile, m.notes)
+            if samples is None:
+                samples = await repo.style_samples()   # одни на весь цикл: стиль ментора общий
+            text = await llm.gen_ping(m.display, m.status, recent, profile, m.notes,
+                                      samples=samples)
             hits = forbidden_hits(text, stage)
-            if hits:
-                log.warning("ping for %s touched forbidden %s, regenerating", username, hits)
-                text = await llm.gen_ping(m.display, m.status, recent, profile, m.notes, avoid=hits)
+            tells = ai_tells(text)
+            if hits or tells:
+                log.warning("ping for %s touched %s, regenerating", username, hits + tells)
+                text = await llm.gen_ping(m.display, m.status, recent, profile, m.notes,
+                                          avoid=hits + tells, samples=samples)
                 hits = forbidden_hits(text, stage)
+            # штамп, переживший переписку, — повод поправить тон, но не держать пинг:
+            # на одобрение уходят только запретные темы и созвоны
+            text = normalize_dashes(text, samples)
         except Exception:
             log.exception("ping generation failed for %s", username)
             errors += 1
@@ -267,8 +278,11 @@ async def remind_cycle(repo, sender, now_utc: datetime | None = None, settings=N
             return
     threshold = (now_utc - timedelta(hours=4)).isoformat()
     for q in await repo.open_questions(older_than_iso=threshold, unreminded_only=True):
+        # черновик бывает и на «устал» или «сдал спринт» — «вопросом» такое не назовёшь
+        what = "сообщение" if q.get("kind") == KIND_HUMAN else "вопрос"
         await sender.notify_mentor(
-            f"⏰ Висит вопрос от @{q['username']} ({q['created_ts'][:16]}):\n{q['question'][:200]}"
+            f"⏰ Висит без ответа {what} от @{q['username']} ({q['created_ts'][:16]}):\n"
+            f"{q['question'][:200]}"
         )
         await repo.mark_reminded(q["id"])
 

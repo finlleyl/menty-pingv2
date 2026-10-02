@@ -1,12 +1,17 @@
 import logging
-from datetime import datetime, timezone
+import re
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import numpy as np
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from mentor_bot.llm import looks_like_interview, looks_like_verdict
-from mentor_bot.stages import parse_stage
+from mentor_bot.pings import parse_iso_utc
+from mentor_bot.stages import STAGE_LABELS, call_permission, parse_stage
+from mentor_bot.store.repo import KIND_HUMAN, KIND_QUESTION
+from mentor_bot.style import TECH_KINDS, draft_problems, normalize_dashes
 
 log = logging.getLogger(__name__)
 
@@ -14,11 +19,76 @@ log = logging.getLogger(__name__)
 # Для text-embedding-3-small перефразировки одного вопроса обычно выше 0.7, разные темы — ниже.
 SIMILAR_MIN = 0.7
 
+# На что ментору готовим черновик. «спасибо/ок» и голая смена статуса — без черновика
+REPLY_KINDS = ("tech_question", "org_question", "feelings", "win")
+
+DIALOG_LIMIT = 10      # сколько прошлой переписки видят сортировщик и черновик
+ONGOING_HOURS = 12     # писали друг другу в эти часы — диалог идёт, «Привет!» в ответе лишний
+
 
 def _kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=t, callback_data=d) for t, d in row] for row in rows
     ])
+
+
+def _prior_dialog(recent: list[dict], text: str) -> list[dict]:
+    """Переписка до буфера. Новые сообщения уже лежат в messages хвостом — отрезаем их,
+    иначе модель увидит их дважды и не отличит старое от нового."""
+    out, rest = list(recent), text
+    while rest and out and out[-1]["direction"] == "in":
+        t = out[-1]["text"]
+        if t == "[медиа]":
+            out.pop()
+        elif rest == t or rest.endswith("\n" + t):
+            rest = rest[: -len(t)].removesuffix("\n")
+            out.pop()
+        else:
+            break
+    return out
+
+
+_GREETING_RE = re.compile(r"\s*(?:привет|здравствуй|добр(?:ое|ый)|хай|салют|ку\b)", re.IGNORECASE)
+
+
+def _ongoing(prior: list[dict], text: str, ts_iso: str) -> bool:
+    """Диалог идёт — «Привет!» в ответе звучит как бот. Но если ученик поздоровался сам,
+    ответить тем же нормально."""
+    if not prior or _GREETING_RE.match(text):
+        return False
+    return parse_iso_utc(ts_iso) - parse_iso_utc(prior[-1]["ts"]) < timedelta(hours=ONGOING_HOURS)
+
+
+def _kinds(tri) -> list[str]:
+    """Метки сортировщика, поправленные кодом там, где ошибка дорога."""
+    kinds = list(dict.fromkeys(tri.kinds)) or ["smalltalk"]
+    # сдал спринт / легенда готова — это и смена этапа; решает всё равно ментор кнопкой
+    if tri.milestone != "none" and "status_change" not in kinds:
+        kinds.append("status_change")
+    # человеку плохо — черновик нужен, даже если модель не поставила «переживания»
+    if tri.urgent and not any(k in REPLY_KINDS for k in kinds):
+        kinds.append("feelings")
+    return kinds
+
+
+def _header(username: str, kinds: list[str], urgent: bool) -> str:
+    question = any(k in TECH_KINDS for k in kinds)
+    if "feelings" in kinds:
+        head = f"💬 @{username} делится и спрашивает:" if question else f"💬 @{username} делится:"
+    elif "win" in kinds:
+        head = f"🎉 @{username}:"
+    else:
+        head = f"❓ @{username} спрашивает:"
+    return f"🔥 {head}" if urgent else head
+
+
+@dataclass
+class Draft:
+    text: str
+    problems: list[str]    # что осталось после переписывания — ментору строкой «⚠️ проверь»
+    emb: list[float]
+    kind: str              # группа для questions.kind
+    similar: int
 
 
 class Service:
@@ -123,28 +193,25 @@ class Service:
     async def handle_buffered(self, username: str, text: str, ts_iso: str):
         """Разбор накопленного за окно дебаунса. Вызывается джобом drain_pending."""
         m = self.by_username.get(username)
-        kind = await self.llm.classify(text)
-        if kind == "question":
-            emb = (await self.llm.embed([text]))[0]
-            chunks = self.kb.search(text, emb, k=5)
-            profile = await self.repo.get_profile(username)
-            similar = await self._similar_answers(emb)
-            examples = await self.repo.edit_examples(5)
-            draft = await self.llm.draft_answer(text, chunks, profile,
-                                                examples=examples, similar=similar)
-            qid = await self.repo.add_question(username, text, draft, ts_iso, emb=emb)
-            note = f"\n\n(учтено твоих прошлых ответов на похожее: {len(similar)})" if similar else ""
-            await self.sender.notify_mentor(
-                f"❓ @{username} спрашивает:\n{text}\n\nЧЕРНОВИК:\n{draft}{note}",
-                reply_markup=_kb([[("Отправить", f"q:send:{qid}"), ("✏️ Править", f"q:edit:{qid}"),
-                                   ("Игнор", f"q:ign:{qid}")]]),
-            )
-        elif kind == "progress":
-            upd = await self.llm.parse_status(text, m.status if m else None)
-            if upd.new_status and m is not None:
-                hint = "уверенно" if upd.confidence == "high" else "под вопросом"
-                await self._propose(username, m, upd.new_status, text, f"@{username} написал",
-                                    f" ({hint})")
+        status = m.status if m else None
+        recent = await self.repo.recent_messages(username, limit=DIALOG_LIMIT * 3)
+        prior = _prior_dialog(recent, text)[-DIALOG_LIMIT:]
+        tri = await self.llm.triage(text, prior, status)
+        kinds = _kinds(tri)
+        # все запросы к модели — до первого сообщения ментору: если провайдер упадёт посередине,
+        # буфер повторится целиком, и черновик с предложением статуса не задвоятся
+        upd = None
+        if "status_change" in kinds and m is not None:
+            upd = await self.llm.parse_status(text, status)
+        draft = None
+        if (tri.needs_reply or tri.urgent) and any(k in REPLY_KINDS for k in kinds):
+            draft = await self._compose_draft(username, m, text, ts_iso, tri, kinds, prior)
+        if draft is not None:
+            await self._deliver_draft(username, status, text, ts_iso, kinds, tri.urgent, draft)
+        if upd is not None and upd.new_status:
+            hint = "уверенно" if upd.confidence == "high" else "под вопросом"
+            await self._propose(username, m, upd.new_status, text, f"@{username} написал",
+                                f" ({hint})")
         # фидбэк с собеса — последним и без права уронить разбор: основное уже сделано,
         # и повтор буфера из-за этого шага продублировал бы черновики и предложения
         if (m is not None and parse_stage(m.status) in ("interviews", "market")
@@ -153,6 +220,61 @@ class Service:
                 await self._collect_interview(username, text, ts_iso)
             except Exception:
                 log.exception("interview extraction failed for %s", username)
+
+    async def _compose_draft(self, username, m, text, ts_iso, tri, kinds, prior) -> Draft:
+        """Черновик ответа: генерация → проверка кодом → при нарушении одна переписка."""
+        status = m.status if m else None
+        stage = parse_stage(status)
+        # регламент считает код, а не модель: созвон только после спринта или к моку
+        call = call_permission(tri.milestone, stage)
+        question = any(k in TECH_KINDS for k in kinds)
+        group = KIND_QUESTION if question else KIND_HUMAN
+        ongoing = _ongoing(prior, text, ts_iso)
+        emb = (await self.llm.embed([text]))[0]
+        samples = await self.repo.style_samples()
+        similar = await self._similar_answers(emb)
+        ctx = dict(
+            recent=prior, stage_label=STAGE_LABELS[stage], status=status,
+            notes=m.notes if m else None, profile=await self.repo.get_profile(username),
+            # на «устал» или «сдал!» базу знаний не ищем вовсе: поиск всегда что-то вернёт,
+            # и модель притянет к настроению пять случайных кусков про Go
+            chunks=self.kb.search(text, emb, k=5) if question else None,
+            similar=similar, examples=await self.repo.edit_examples(5, kind=group),
+            samples=samples, call=call, urgent=tri.urgent, ongoing=ongoing,
+        )
+        reply = await self.llm.draft_reply(text, kinds, **ctx)
+        problems = draft_problems(reply, kinds, call, ongoing)
+        if problems:
+            log.warning("draft for %s failed lint %s, regenerating", username, problems)
+            reply = await self.llm.draft_reply(text, kinds, **ctx, avoid=problems)
+            problems = draft_problems(reply, kinds, call, ongoing)
+        return Draft(normalize_dashes(reply, samples), problems, emb, group, len(similar))
+
+    async def _stage_line(self, username: str, status, ts_iso: str) -> str:
+        """«📍 3-й спринт обучения · на стадии 12 дн.» — где ученик, чтобы не лезть в таблицу."""
+        stage = parse_stage(status)
+        if stage == "unknown":
+            return ""
+        line = f"\n📍 {STAGE_LABELS[stage]}"
+        since = (await self.repo.get_mentee(username) or {}).get("status_since")
+        if since:
+            days = (parse_iso_utc(ts_iso) - parse_iso_utc(since)).days
+            if days >= 0:
+                line += f" · на стадии {days} дн."
+        return line
+
+    async def _deliver_draft(self, username, status, text, ts_iso, kinds, urgent, d: Draft):
+        qid = await self.repo.add_question(username, text, d.text, ts_iso, emb=d.emb, kind=d.kind)
+        # ментор читает каждый черновик, поэтому недочищенное не прячем, а подсвечиваем
+        warn = f"\n\n⚠️ проверь: {'; '.join(d.problems)}" if d.problems else ""
+        note = f"\n\n(учтено твоих прошлых ответов на похожее: {d.similar})" if d.similar else ""
+        await self.sender.notify_mentor(
+            f"{_header(username, kinds, urgent)}\n{text}{await self._stage_line(username, status, ts_iso)}"
+            f"\n\nЧЕРНОВИК:\n{d.text}{warn}{note}",
+            reply_markup=_kb([[("Отправить", f"q:send:{qid}"), ("✏️ Править", f"q:edit:{qid}"),
+                               ("Игнор", f"q:ign:{qid}")]]),
+        )
+
     async def _collect_interview(self, username: str, text: str, ts_iso: str):
         report = await self.llm.extract_interview(text)
         if report is None or not report.items:

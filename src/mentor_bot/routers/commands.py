@@ -53,7 +53,7 @@ async def status_text(service, repo, settings, now_utc: datetime) -> str:
         f"dry-run: {'ON' if dryrun else 'OFF'} | pause_all: {'ON' if pause_all else 'OFF'}",
         f"Пора пинговать ({len(due)}): " + _listing(due),
         f"Чат не привязан ({len(unbound)}): " + _listing(unbound),
-        f"Открытых вопросов: {len(open_qs)}",
+        f"Открытых черновиков ответов: {len(open_qs)}",
     ]
     return "\n".join(lines)
 

@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS questions(
   state TEXT NOT NULL DEFAULT 'open',
   reminded INTEGER NOT NULL DEFAULT 0,
   final TEXT,
-  emb TEXT
+  emb TEXT,
+  kind TEXT NOT NULL DEFAULT 'question'
 );
 CREATE TABLE IF NOT EXISTS proposals(
   id INTEGER PRIMARY KEY AUTOINCREMENT,

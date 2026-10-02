@@ -65,7 +65,7 @@ async def handle_edit_text(text: str, repo, sender, service) -> str | None:
         q = await repo.get_question(int(ident))
         if not q or q["state"] != "open" or not await repo.claim("questions", q["id"]):
             await repo.set_setting(EDIT_KEY, "")
-            return "Вопрос уже закрыт — ничего не отправил"
+            return "Черновик уже закрыт — ничего не отправил"
         try:
             result = await sender.send_to_mentee(q["username"], text)
         except Exception:

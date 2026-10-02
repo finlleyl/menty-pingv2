@@ -80,16 +80,10 @@ async def make_svc(tmp_path, kind="question"):
 
 async def test_drain_merges_texts_into_one_llm_call(tmp_path):
     repo, sender, svc = await make_svc(tmp_path)
-    seen = []
-
-    async def classify(text):
-        seen.append(text)
-        return "question"
-
-    svc.llm.classify = classify
     await repo.buffer_incoming("ivan", "привет", "2026-08-27T10:00:00+00:00")
     await repo.buffer_incoming("ivan", "как работает select?", "2026-08-27T10:00:30+00:00")
     await drain_pending(svc, repo, sender, Cfg3(), now_utc=NOW)
+    seen = [c["text"] for c in svc.llm.triage_calls]
     assert seen == ["привет\nкак работает select?"]     # один вызов, склеенный текст
     assert await repo.get_pending("ivan") is None
 
@@ -115,10 +109,10 @@ async def test_drain_cancels_when_mentor_answered_in_between(tmp_path):
 async def test_drain_clears_buffer_even_when_handling_raises(tmp_path):
     repo, sender, svc = await make_svc(tmp_path)
 
-    async def boom(text):
+    async def boom(*a, **kw):
         raise RuntimeError("битый ответ")
 
-    svc.llm.classify = boom
+    svc.llm.triage = boom
     await repo.buffer_incoming("ivan", "вопрос", "2026-08-27T10:00:00+00:00")
     await drain_pending(svc, repo, sender, Cfg3(), now_utc=NOW)
     # буфер снят, иначе сломанное сообщение дренажилось бы каждую минуту вечно
