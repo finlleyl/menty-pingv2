@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     digest_hour: int = 10
     stop_statuses: str = "умер,оффер,приостановил,договор,ушел,ушёл,на стопе"
     log_level: str = "INFO"
+    # точные заголовки колонок (регистр не важен), если бот путает их сам; пусто — угадывает
+    header_mentee: str = ""
+    header_date: str = ""
+    header_status: str = ""
+    header_notes: str = ""
+    header_dossier: str = ""
 
     @property
     def active_sheet_titles(self) -> list[str]:
@@ -39,6 +45,14 @@ class Settings(BaseSettings):
     @property
     def stop_status_list(self) -> list[str]:
         return [t.strip().lower() for t in self.stop_statuses.split(",") if t.strip()]
+
+    @property
+    def header_overrides(self) -> dict[str, str]:
+        """Роль колонки → заголовок из HEADER_*, только заданные — для SheetsClient."""
+        pairs = {"mentee": self.header_mentee, "date": self.header_date,
+                 "status": self.header_status, "notes": self.header_notes,
+                 "dossier": self.header_dossier}
+        return {role: v.strip() for role, v in pairs.items() if v.strip()}
 
 
 def load_settings() -> Settings:
