@@ -276,3 +276,62 @@ async def test_style_samples_take_mentor_edits_but_not_model_text(tmp_path):
     await repo.log_message("ivan", "out", "close(ch) только со стороны отправителя", "2026-09-01T10:02:00+00:00", source=SRC_BOT_EDIT)
     assert await repo.style_samples() == ["close(ch) только со стороны отправителя"]
     await repo.close()
+
+
+async def test_old_database_is_upgraded_once_and_embeddings_become_blobs(tmp_path):
+    import json
+
+    import aiosqlite
+    from mentor_bot.store.repo import MIGRATIONS
+
+    path = str(tmp_path / "old.db")
+    conn = await aiosqlite.connect(path)
+    await conn.execute(
+        "CREATE TABLE questions(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL, "
+        "question TEXT NOT NULL, draft TEXT NOT NULL, created_ts TEXT NOT NULL, "
+        "state TEXT NOT NULL DEFAULT 'open', reminded INTEGER NOT NULL DEFAULT 0, final TEXT, emb TEXT)"
+    )
+    await conn.execute(
+        "INSERT INTO questions(username, question, draft, created_ts, final, emb) VALUES "
+        "('ivan', 'как закрыть канал?', 'черновик', '2026-08-01T10:00:00+00:00', 'отправитель', ?)",
+        (json.dumps([0.5, 0.5, 0.0]),),
+    )
+    await conn.commit()
+    await conn.close()
+
+    repo = await Repo.open(path)
+    assert (await repo._one("PRAGMA user_version"))["user_version"] == len(MIGRATIONS)
+    assert (await repo._one("SELECT typeof(emb) AS t FROM questions"))["t"] == "blob"
+    [row] = await repo.answered_questions()
+    assert list(row["emb"]) == [0.5, 0.5, 0.0]
+    await repo.close()
+    repo = await Repo.open(path)                      # второй старт — миграции не повторяются
+    assert len(await repo.answered_questions()) == 1
+    await repo.close()
+
+
+async def test_vectors_of_another_embedding_model_are_not_compared(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    q1 = await repo.add_question("ivan", "старый вопрос", "ч", "2026-09-01T10:00:00+00:00",
+                                 emb=[1.0, 0.0], emb_model="old-model")
+    q2 = await repo.add_question("ivan", "новый вопрос", "ч", "2026-09-02T10:00:00+00:00",
+                                 emb=[1.0, 0.0, 0.0], emb_model="new-model")
+    for qid in (q1, q2):
+        await repo.set_question_final(qid, "ответ ментора")
+    rows = await repo.answered_questions(model="new-model")
+    assert [r["question"] for r in rows] == ["новый вопрос"]
+    await repo.close()
+
+
+async def test_transaction_rolls_back_on_error(tmp_path):
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    try:
+        async with repo._tx() as c:
+            await c.execute("INSERT INTO settings(key, value) VALUES ('a', '1')")
+            raise RuntimeError("упали посередине")
+    except RuntimeError:
+        pass
+    assert await repo.get_setting("a") is None
+    await repo.set_setting("b", "2")                  # замок освобождён, база пишется дальше
+    assert await repo.get_setting("b") == "2"
+    await repo.close()

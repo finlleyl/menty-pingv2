@@ -105,3 +105,11 @@ def test_recall_at_k():
              {"question": "что такое мапа", "expected": "Мапы"}]
     recall, misses = recall_at_k(StubIndex(), cases, [[0.0], [0.0]], k=1)
     assert recall == 0.5 and misses == ["что такое мапа"]
+
+
+def test_search_survives_index_built_by_another_embedding_model(tmp_path):
+    from mentor_bot.kb import KBIndex
+    idx = KBIndex(str(tmp_path / "kb"))
+    idx.build(["про каналы", "про мьютексы"], [[1.0, 0.0], [0.0, 1.0]], ["урок 1", "урок 2"])
+    # сменили EMBED_MODEL: вектор вопроса другой длины — без материалов, но без падения
+    assert idx.search("каналы", [1.0, 0.0, 0.0]) == []

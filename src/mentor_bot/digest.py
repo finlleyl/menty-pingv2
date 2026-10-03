@@ -1,4 +1,5 @@
 """Тексты недельной сводки (/digest) и отчёта «на чём срезаются» (/fails)."""
+from collections import Counter
 from datetime import datetime, timedelta
 
 from mentor_bot.analytics import PIPELINE, UNTIMED, cluster, km_quantile, stage_samples
@@ -23,8 +24,19 @@ def _days(x: float) -> str:
     return f"{x:.0f} дн."
 
 
-async def fails_text(repo, since_iso: str | None = None, top: int = 10) -> str:
-    rows = await repo.interview_questions(failed_only=True, since_iso=since_iso)
+def _same_dim(rows):
+    """Векторы одной длины — самой частой. После смены модели эмбеддингов старые записи
+    без метки иной длины, и кластеризация на них упала бы."""
+    if not rows:
+        return rows
+    dims = Counter(len(r["emb"]) for r in rows)
+    dim = dims.most_common(1)[0][0]
+    return [r for r in rows if len(r["emb"]) == dim]
+
+
+async def fails_text(repo, since_iso: str | None = None, top: int = 10, model=None) -> str:
+    rows = _same_dim(await repo.interview_questions(failed_only=True, since_iso=since_iso,
+                                                    model=model))
     if not rows:
         return "Провалов на собесах пока не записано"
     groups = cluster([r["emb"] for r in rows], FAIL_CLUSTER_MIN)
@@ -96,5 +108,6 @@ async def digest_text(service, repo, settings, now_utc: datetime) -> str:
 
     fails = await repo.interview_questions(failed_only=True, since_iso=week_ago.isoformat())
     if fails:
-        lines.append("\n" + await fails_text(repo, since_iso=week_ago.isoformat(), top=5))
+        lines.append("\n" + await fails_text(repo, since_iso=week_ago.isoformat(), top=5,
+                                             model=getattr(settings, "embed_model", None)))
     return "\n".join(lines)

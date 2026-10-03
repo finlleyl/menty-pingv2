@@ -158,7 +158,7 @@ def make_router(service, repo, sender, settings, reindex_fn, backup_fn=None) -> 
     @router.message(Command("fails"))
     async def cmd_fails(message: Message):
         from mentor_bot.digest import fails_text
-        await message.answer(await fails_text(repo))
+        await message.answer(await fails_text(repo, model=settings.embed_model))
 
     @router.message(Command("pingmode"))
     async def cmd_pingmode(message: Message):

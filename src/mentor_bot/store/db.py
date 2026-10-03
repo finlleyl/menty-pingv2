@@ -1,3 +1,5 @@
+# Полная схема для свежей базы. Старые базы догоняют миграции из repo.MIGRATIONS: индекс по
+# колонке, которую добавляет миграция, сюда не кладём — на старой базе её ещё нет.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS mentees(
   username TEXT PRIMARY KEY,
@@ -38,9 +40,11 @@ CREATE TABLE IF NOT EXISTS questions(
   state TEXT NOT NULL DEFAULT 'open',
   reminded INTEGER NOT NULL DEFAULT 0,
   final TEXT,
-  emb TEXT,
-  kind TEXT NOT NULL DEFAULT 'question'
+  emb BLOB,
+  kind TEXT NOT NULL DEFAULT 'question',
+  emb_model TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_questions_user_state ON questions(username, state);
 -- style_samples отсекает черновики, ушедшие как есть, сравнением текста — без индекса это скан
 CREATE INDEX IF NOT EXISTS idx_questions_draft ON questions(draft);
 CREATE TABLE IF NOT EXISTS proposals(
@@ -87,7 +91,8 @@ CREATE TABLE IF NOT EXISTS interview_notes(
   stage TEXT,
   question TEXT NOT NULL,
   failed INTEGER NOT NULL DEFAULT 0,
-  emb TEXT
+  emb BLOB,
+  emb_model TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_interview_notes_user_ts ON interview_notes(username, source_ts);
 CREATE TABLE IF NOT EXISTS ping_drafts(
@@ -97,6 +102,7 @@ CREATE TABLE IF NOT EXISTS ping_drafts(
   created_ts TEXT NOT NULL,
   state TEXT NOT NULL DEFAULT 'open'
 );
+CREATE INDEX IF NOT EXISTS idx_ping_drafts_user_state ON ping_drafts(username, state);
 CREATE TABLE IF NOT EXISTS llm_usage(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts TEXT NOT NULL,
@@ -106,4 +112,5 @@ CREATE TABLE IF NOT EXISTS llm_usage(
   completion_tokens INTEGER NOT NULL DEFAULT 0,
   cost REAL
 );
+CREATE INDEX IF NOT EXISTS idx_llm_usage_ts ON llm_usage(ts);
 """

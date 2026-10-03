@@ -1,8 +1,11 @@
+import asyncio
 import json
 import os
+from contextlib import asynccontextmanager
 from datetime import timedelta
 
 import aiosqlite
+import numpy as np
 
 from .db import SCHEMA
 
@@ -27,60 +30,133 @@ STYLE_MIN_CHARS = 15
 STYLE_MAX_CHARS = 600
 
 
+def pack_emb(emb) -> bytes:
+    """Вектор → float32 BLOB: в 5–6 раз компактнее JSON-текста, бэкап и память меньше."""
+    return np.asarray(emb, dtype=np.float32).tobytes()
+
+
+def unpack_emb(value):
+    """BLOB (или JSON-текст старого формата) → np.ndarray; None — вектора нет."""
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return np.frombuffer(bytes(value), dtype=np.float32)
+    return np.asarray(json.loads(value), dtype=np.float32)
+
+
+async def _has_column(conn, table, col) -> bool:
+    cur = await conn.execute(f"PRAGMA table_info({table})")
+    return col in {row[1] for row in await cur.fetchall()}
+
+
+async def _add_column(conn, table, col, decl):
+    if not await _has_column(conn, table, col):
+        await conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+
+
+# Миграции — шаги схемы по порядку; номер последнего применённого лежит в PRAGMA user_version.
+# Каждый шаг безопасен и для свежей базы (SCHEMA уже создала всё нужное), и для старой.
+# SCHEMA выполняется раньше миграций, поэтому индексы по колонкам, которые добавляет
+# миграция, создаёт сама миграция, а не SCHEMA: на старой базе этих колонок ещё нет.
+
+async def _m1_legacy_columns(conn):
+    """Колонки, которые прошлые версии догоняли при каждом старте."""
+    for table, col, decl in (
+        ("mentees", "status_since", "TEXT"), ("mentees", "last_status", "TEXT"),
+        ("proposals", "from_status", "TEXT"), ("questions", "final", "TEXT"),
+        ("questions", "emb", "TEXT"),
+        # до разбора эмоций все черновики были ответами на вопросы — отсюда и DEFAULT
+        ("questions", "kind", f"TEXT NOT NULL DEFAULT '{KIND_QUESTION}'"),
+        ("messages", "source", f"TEXT NOT NULL DEFAULT '{SRC_CHAT}'"),
+    ):
+        await _add_column(conn, table, col, decl)
+
+
+async def _m2_pending_rows(conn):
+    """Буфер старого формата (JSON-список в pending.texts) — в построчный pending_messages."""
+    cur = await conn.execute(
+        "SELECT username, last_in_ts, texts FROM pending WHERE texts NOT IN ('', '[]')"
+    )
+    for username, last_in_ts, texts in await cur.fetchall():
+        try:
+            old = json.loads(texts)
+        except ValueError:
+            old = []      # битый буфер не должен ронять старт бота
+        for text in old:
+            await conn.execute(
+                "INSERT INTO pending_messages(username, text, ts) VALUES (?,?,?)",
+                (username, text, last_in_ts),
+            )
+        await conn.execute("UPDATE pending SET texts='[]' WHERE username=?", (username,))
+
+
+async def _m3_embeddings(conn):
+    """Эмбеддинги — float32 BLOB с меткой модели. Раньше после смены EMBED_MODEL векторы разной
+    длины сравнивались друг с другом, и падали поиск похожих ответов, /fails и сводка."""
+    for table in ("questions", "interview_notes"):
+        await _add_column(conn, table, "emb_model", "TEXT")
+        cur = await conn.execute(f"SELECT id, emb FROM {table} WHERE typeof(emb)='text'")
+        for rid, emb in await cur.fetchall():
+            try:
+                blob = pack_emb(json.loads(emb))
+            except ValueError:
+                blob = None
+            await conn.execute(f"UPDATE {table} SET emb=? WHERE id=?", (blob, rid))
+
+
+MIGRATIONS = (_m1_legacy_columns, _m2_pending_rows, _m3_embeddings)
+
+
 class Repo:
     def __init__(self, conn: aiosqlite.Connection):
         self._c = conn
+        # Соединение одно на всё приложение, а хендлеры и джобы пишут конкурентно. Без замка
+        # commit одной корутины фиксировал бы полузаписанную транзакцию другой
+        self._write = asyncio.Lock()
 
     @classmethod
     async def open(cls, path: str) -> "Repo":
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         conn = await aiosqlite.connect(path)
         conn.row_factory = aiosqlite.Row
+        # WAL: чтение (бэкап, sqlite3 или Datasette рядом с ботом) не ждёт записи и не мешает ей;
+        # busy_timeout — подождать занятый файл, а не упасть сразу с «database is locked»
+        await conn.execute("PRAGMA journal_mode=WAL")
+        await conn.execute("PRAGMA busy_timeout=5000")
         await conn.executescript(SCHEMA)
         await cls._migrate(conn)
-        await cls._migrate_pending(conn)
-        await conn.commit()
         return cls(conn)
 
     @staticmethod
     async def _migrate(conn):
-        """Догоняем схему на базах, созданных прошлыми версиями."""
-        for table, col, decl in (
-            ("mentees", "status_since", "TEXT"), ("mentees", "last_status", "TEXT"),
-            ("proposals", "from_status", "TEXT"), ("questions", "final", "TEXT"),
-            ("questions", "emb", "TEXT"),
-            # до разбора эмоций все черновики были ответами на вопросы — отсюда и DEFAULT
-            ("questions", "kind", f"TEXT NOT NULL DEFAULT '{KIND_QUESTION}'"),
-            ("messages", "source", f"TEXT NOT NULL DEFAULT '{SRC_CHAT}'"),
-        ):
-            cur = await conn.execute(f"PRAGMA table_info({table})")
-            if col not in {row[1] for row in await cur.fetchall()}:
-                await conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
-
-    @staticmethod
-    async def _migrate_pending(conn):
-        """Буфер старого формата (JSON-список в pending.texts) — в построчный pending_messages."""
-        cur = await conn.execute(
-            "SELECT username, last_in_ts, texts FROM pending WHERE texts NOT IN ('', '[]')"
-        )
-        for username, last_in_ts, texts in await cur.fetchall():
-            try:
-                old = json.loads(texts)
-            except ValueError:
-                old = []      # битый буфер не должен ронять старт бота
-            for text in old:
-                await conn.execute(
-                    "INSERT INTO pending_messages(username, text, ts) VALUES (?,?,?)",
-                    (username, text, last_in_ts),
-                )
-            await conn.execute("UPDATE pending SET texts='[]' WHERE username=?", (username,))
+        cur = await conn.execute("PRAGMA user_version")
+        version = (await cur.fetchone())[0]
+        for number, step in enumerate(MIGRATIONS[version:], start=version + 1):
+            await step(conn)
+            await conn.execute(f"PRAGMA user_version={number}")
+            await conn.commit()
+        await conn.commit()
 
     async def close(self):
         await self._c.close()
 
     async def _exec(self, sql: str, args: tuple = ()):
-        await self._c.execute(sql, args)
-        await self._c.commit()
+        async with self._write:
+            cur = await self._c.execute(sql, args)
+            await self._c.commit()
+            return cur
+
+    @asynccontextmanager
+    async def _tx(self):
+        """Несколько записей одним целым: либо все, либо ни одной. Внутри — только
+        self._c напрямую: методы с _exec возьмут тот же замок и повиснут."""
+        async with self._write:
+            try:
+                yield self._c
+            except BaseException:
+                await self._c.rollback()
+                raise
+            await self._c.commit()
 
     async def _one(self, sql: str, args: tuple = ()):
         cur = await self._c.execute(sql, args)
@@ -93,10 +169,11 @@ class Repo:
 
     # mentees
     async def upsert_mentee(self, username, chat_id=None, sheet_title=None, row=None):
-        await self._exec("INSERT OR IGNORE INTO mentees(username) VALUES (?)", (username,))
-        for col, val in (("chat_id", chat_id), ("sheet_title", sheet_title), ("row", row)):
-            if val is not None:
-                await self._exec(f"UPDATE mentees SET {col}=? WHERE username=?", (val, username))
+        async with self._tx() as c:
+            await c.execute("INSERT OR IGNORE INTO mentees(username) VALUES (?)", (username,))
+            for col, val in (("chat_id", chat_id), ("sheet_title", sheet_title), ("row", row)):
+                if val is not None:
+                    await c.execute(f"UPDATE mentees SET {col}=? WHERE username=?", (val, username))
 
     async def get_mentee(self, username):
         return await self._one("SELECT * FROM mentees WHERE username=?", (username,))
@@ -106,8 +183,9 @@ class Repo:
 
     async def set_status_since(self, username, ts_iso):
         """Момент, когда ментор подтвердил текущий статус. От него считается ожидание."""
-        await self._exec("INSERT OR IGNORE INTO mentees(username) VALUES (?)", (username,))
-        await self._exec("UPDATE mentees SET status_since=? WHERE username=?", (ts_iso, username))
+        async with self._tx() as c:
+            await c.execute("INSERT OR IGNORE INTO mentees(username) VALUES (?)", (username,))
+            await c.execute("UPDATE mentees SET status_since=? WHERE username=?", (ts_iso, username))
 
     async def record_status(self, username, status, ts_iso, source) -> bool:
         """Фиксирует статус, увиденный в таблице (source='sheet') или подтверждённый кнопкой
@@ -118,28 +196,31 @@ class Repo:
         True — был настоящий переход."""
         from mentor_bot.stages import parse_stage
         status = (status or "").strip()
-        await self._exec("INSERT OR IGNORE INTO mentees(username) VALUES (?)", (username,))
-        rec = await self.get_mentee(username)
-        prev = rec["last_status"]
-        if prev == status:
-            return False
-        if not status and prev:
-            return False  # ячейку на минуту очистили — это не смена стадии
-        initial = prev is None and source == "sheet"
-        await self._exec(
-            "INSERT INTO status_history(username, from_status, to_status, ts, source) "
-            "VALUES (?,?,?,?,?)",
-            (username, prev, status, ts_iso, "initial" if initial else source),
-        )
-        if initial or parse_stage(prev) == parse_stage(status):
-            # первое наблюдение или переименование («3 спринт» → «Спринт 3»): таймер стадии не сбрасываем
-            await self._exec("UPDATE mentees SET last_status=? WHERE username=?", (status, username))
-            return False
-        await self._exec(
-            "UPDATE mentees SET last_status=?, status_since=? WHERE username=?",
-            (status, ts_iso, username),
-        )
-        return True
+        # чтение и запись — одной транзакцией: синк таблицы и кнопка «Да» иначе читали бы один
+        # и тот же прошлый статус и писали в историю два перехода
+        async with self._tx() as c:
+            await c.execute("INSERT OR IGNORE INTO mentees(username) VALUES (?)", (username,))
+            cur = await c.execute("SELECT last_status FROM mentees WHERE username=?", (username,))
+            prev = (await cur.fetchone())[0]
+            if prev == status:
+                return False
+            if not status and prev:
+                return False  # ячейку на минуту очистили — это не смена стадии
+            initial = prev is None and source == "sheet"
+            await c.execute(
+                "INSERT INTO status_history(username, from_status, to_status, ts, source) "
+                "VALUES (?,?,?,?,?)",
+                (username, prev, status, ts_iso, "initial" if initial else source),
+            )
+            if initial or parse_stage(prev) == parse_stage(status):
+                # первое наблюдение или переименование («3 спринт» → «Спринт 3»): таймер стадии не сбрасываем
+                await c.execute("UPDATE mentees SET last_status=? WHERE username=?", (status, username))
+                return False
+            await c.execute(
+                "UPDATE mentees SET last_status=?, status_since=? WHERE username=?",
+                (status, ts_iso, username),
+            )
+            return True
 
     async def status_history(self, username=None):
         if username is None:
@@ -211,14 +292,13 @@ class Repo:
 
     # questions
     async def add_question(self, username, question, draft, ts_iso, emb=None,
-                           kind=KIND_QUESTION) -> int:
-        cur = await self._c.execute(
-            "INSERT INTO questions(username, question, draft, created_ts, emb, kind) "
-            "VALUES (?,?,?,?,?,?)",
-            (username, question, draft, ts_iso, json.dumps(emb) if emb is not None else None,
-             kind),
+                           kind=KIND_QUESTION, emb_model=None) -> int:
+        cur = await self._exec(
+            "INSERT INTO questions(username, question, draft, created_ts, emb, kind, emb_model) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (username, question, draft, ts_iso, pack_emb(emb) if emb is not None else None,
+             kind, emb_model),
         )
-        await self._c.commit()
         return cur.lastrowid
 
     async def get_question(self, qid):
@@ -292,8 +372,9 @@ class Repo:
                 break
         return out
 
-    async def answered_questions(self, limit=500):
+    async def answered_questions(self, limit=500, model=None):
         """Вопросы с настоящим ответом ментора и эмбеддингом вопроса — для поиска похожих.
+        model — только векторы этой модели (и старые, без метки): чужие с ними не сравнить.
 
         Технический черновик, отправленный как есть, — ответ, который ментор проверил: факты
         в нём годятся. А тёплый ответ без правки — это тон модели, и подсовывать его как
@@ -301,11 +382,12 @@ class Repo:
         rows = await self._all(
             "SELECT question, final, emb FROM questions "
             "WHERE final IS NOT NULL AND emb IS NOT NULL "
-            f"AND (kind != '{KIND_HUMAN}' OR final != draft) ORDER BY id DESC LIMIT ?",
-            (limit,),
+            f"AND (kind != '{KIND_HUMAN}' OR final != draft) "
+            "AND (? IS NULL OR emb_model IS NULL OR emb_model = ?) ORDER BY id DESC LIMIT ?",
+            (model, model, limit),
         )
         for r in rows:
-            r["emb"] = json.loads(r["emb"])
+            r["emb"] = unpack_emb(r["emb"])
         return rows
 
     async def open_questions(self, older_than_iso=None, unreminded_only=False):
@@ -329,11 +411,10 @@ class Repo:
     # proposals
     async def add_proposal(self, username, new_status, from_status=None) -> int:
         """from_status — статус на момент предложения; None — не сверять (старые записи)."""
-        cur = await self._c.execute(
+        cur = await self._exec(
             "INSERT INTO proposals(username, new_status, from_status) VALUES (?,?,?)",
             (username, new_status, from_status),
         )
-        await self._c.commit()
         return cur.lastrowid
 
     async def get_proposal(self, pid):
@@ -380,16 +461,16 @@ class Repo:
     # построчно в pending_messages: aiogram разбирает апдейты параллельно, и чтение-изменение-
     # запись одного JSON-списка теряло сообщения, пришедшие пачкой
     async def buffer_incoming(self, username, text, ts_iso):
-        await self._c.execute(
-            "INSERT INTO pending(username, last_in_ts, texts) VALUES (?,?,'[]') "
-            "ON CONFLICT(username) DO UPDATE SET last_in_ts=MAX(last_in_ts, excluded.last_in_ts)",
-            (username, ts_iso),
-        )
-        await self._c.execute(
-            "INSERT INTO pending_messages(username, text, ts) VALUES (?,?,?)",
-            (username, text, ts_iso),
-        )
-        await self._c.commit()
+        async with self._tx() as c:
+            await c.execute(
+                "INSERT INTO pending(username, last_in_ts, texts) VALUES (?,?,'[]') "
+                "ON CONFLICT(username) DO UPDATE SET last_in_ts=MAX(last_in_ts, excluded.last_in_ts)",
+                (username, ts_iso),
+            )
+            await c.execute(
+                "INSERT INTO pending_messages(username, text, ts) VALUES (?,?,?)",
+                (username, text, ts_iso),
+            )
 
     async def touch_pending(self, username, ts_iso):
         """Продлить окно, не добавляя текст (медиа без подписи). Нет буфера — no-op."""
@@ -411,9 +492,9 @@ class Repo:
         return {"username": username, "last_in_ts": last, "texts": [r["text"] for r in rows]}
 
     async def drop_pending(self, username):
-        await self._c.execute("DELETE FROM pending_messages WHERE username=?", (username,))
-        await self._c.execute("DELETE FROM pending WHERE username=?", (username,))
-        await self._c.commit()
+        async with self._tx() as c:
+            await c.execute("DELETE FROM pending_messages WHERE username=?", (username,))
+            await c.execute("DELETE FROM pending WHERE username=?", (username,))
 
     async def consume_pending(self, username, upto_id: int):
         """Снять с буфера разобранное — сообщения с id не больше upto_id.
@@ -421,15 +502,15 @@ class Repo:
         Пока дренаж ждал ответа модели, ученик мог дописать ещё, а ментор — ответить сам
         (drop_pending) и ученик — написать снова. Снимаем по id, а не «первые N»: дописанное
         после разбора останется, даже если буфер успели удалить и завести заново."""
-        await self._c.execute(
-            "DELETE FROM pending_messages WHERE username=? AND id<=?", (username, upto_id)
-        )
-        await self._c.execute(
-            "DELETE FROM pending WHERE username=? "
-            "AND NOT EXISTS (SELECT 1 FROM pending_messages WHERE username=?)",
-            (username, username),
-        )
-        await self._c.commit()
+        async with self._tx() as c:
+            await c.execute(
+                "DELETE FROM pending_messages WHERE username=? AND id<=?", (username, upto_id)
+            )
+            await c.execute(
+                "DELETE FROM pending WHERE username=? "
+                "AND NOT EXISTS (SELECT 1 FROM pending_messages WHERE username=?)",
+                (username, username),
+            )
 
     async def mature_pending(self, before_iso):
         """Буферы, в которые ученик не писал с before_iso: [{username, last_in_ts, max_id, texts}].
@@ -471,16 +552,16 @@ class Repo:
         """Консистентная копия базы через то же соединение (без гонки с записями)."""
         if os.path.exists(path):
             os.remove(path)
-        await self._c.commit()   # VACUUM INTO не работает внутри открытой транзакции
-        await self._c.execute("VACUUM INTO ?", (path,))
+        async with self._write:
+            await self._c.commit()   # VACUUM INTO не работает внутри открытой транзакции
+            await self._c.execute("VACUUM INTO ?", (path,))
 
     # ping_drafts — пинги, ждущие решения ментора (режим review или провал проверки)
     async def add_ping_draft(self, username, text, ts_iso) -> int:
-        cur = await self._c.execute(
+        cur = await self._exec(
             "INSERT INTO ping_drafts(username, text, created_ts) VALUES (?,?,?)",
             (username, text, ts_iso),
         )
-        await self._c.commit()
         return cur.lastrowid
 
     async def get_ping_draft(self, pid):
@@ -496,10 +577,9 @@ class Repo:
         """Атомарно забрать запись open → state. Два быстрых нажатия «Отправить» обрабатываются
         конкурентно; отправит только тот, чей UPDATE реально сменил состояние."""
         assert table in ("ping_drafts", "questions")
-        cur = await self._c.execute(
+        cur = await self._exec(
             f"UPDATE {table} SET state=? WHERE id=? AND state='open'", (state, rid)
         )
-        await self._c.commit()
         return cur.rowcount == 1
 
     async def set_ping_draft_state(self, pid, state):
@@ -511,19 +591,23 @@ class Repo:
         )
 
     # interview_notes — вопросы с собесов, которые пересказал ученик
-    async def add_interview_notes(self, username, source_ts, items, embs):
-        for it, emb in zip(items, embs):
-            await self._c.execute(
-                "INSERT INTO interview_notes(username, source_ts, company, stage, question, failed, emb) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (username, source_ts, it.company, it.stage, it.question, int(it.failed),
-                 json.dumps(emb)),
-            )
-        await self._c.commit()
+    async def add_interview_notes(self, username, source_ts, items, embs, emb_model=None):
+        async with self._tx() as c:
+            for it, emb in zip(items, embs):
+                await c.execute(
+                    "INSERT INTO interview_notes(username, source_ts, company, stage, question, "
+                    "failed, emb, emb_model) VALUES (?,?,?,?,?,?,?,?)",
+                    (username, source_ts, it.company, it.stage, it.question, int(it.failed),
+                     pack_emb(emb), emb_model),
+                )
 
-    async def interview_questions(self, failed_only=True, since_iso=None):
+    async def interview_questions(self, failed_only=True, since_iso=None, model=None):
+        """model — только векторы этой модели (и старые, без метки)."""
         sql = "SELECT * FROM interview_notes WHERE emb IS NOT NULL"
         args: list = []
+        if model:
+            sql += " AND (emb_model IS NULL OR emb_model = ?)"
+            args.append(model)
         if failed_only:
             sql += " AND failed=1"
         if since_iso:
@@ -531,5 +615,5 @@ class Repo:
             args.append(since_iso)
         rows = await self._all(sql + " ORDER BY id", tuple(args))
         for r in rows:
-            r["emb"] = json.loads(r["emb"])
+            r["emb"] = unpack_emb(r["emb"])
         return rows

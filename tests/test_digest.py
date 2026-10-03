@@ -46,3 +46,19 @@ async def test_fails_text_ranks_by_distinct_people(tmp_path):
     assert lines[1].startswith("• как устроен map — 2× у 2 чел. [Avito, Ozon]")
     assert lines[2].startswith("• select — 2× у 1 чел.")
     await repo.close()
+
+
+async def test_fails_ignore_vectors_of_another_length(tmp_path):
+    from types import SimpleNamespace
+
+    from mentor_bot.digest import fails_text
+    from mentor_bot.store.repo import Repo
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    item = lambda q: SimpleNamespace(company=None, stage=None, question=q, failed=True)
+    await repo.add_interview_notes("ivan", "2026-08-01T10:00:00+00:00", [item("старый вопрос")], [[1.0, 0.0]])
+    await repo.add_interview_notes("petr", "2026-09-01T10:00:00+00:00",
+                                   [item("про каналы"), item("снова про каналы")],
+                                   [[1.0, 0.0, 0.0], [0.99, 0.1, 0.0]], emb_model="new")
+    text = await fails_text(repo, model="new")
+    assert "про каналы" in text and "старый вопрос" not in text
+    await repo.close()

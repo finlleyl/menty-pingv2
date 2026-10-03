@@ -1,7 +1,10 @@
 import json
+import logging
 import os
 import re
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 # Константа RRF: 1/(k + rank). При k≈60 выигрывает документ, который высоко в ОБОИХ
 # списках, а не одиночный лидер одного из них (при k=0 первое место весит как два вторых).
@@ -115,6 +118,11 @@ class KBIndex:
             return []
         q = np.array(query_emb, dtype=np.float32)
         emb = self._emb
+        if emb.shape[1] != q.shape[0]:
+            # индекс собран другой моделью эмбеддингов (сменили EMBED_MODEL, а /reindex ещё нет):
+            # без материалов черновик хуже, но это лучше, чем падение на каждом вопросе
+            log.warning("KB index dim %d != query dim %d — run /reindex", emb.shape[1], q.shape[0])
+            return []
         denom = (np.linalg.norm(emb, axis=1) * (np.linalg.norm(q) or 1e-9)) + 1e-9
         cos = emb @ q / denom
         bm = np.array(self._bm25.get_scores(tokenize(query) or ["_"]))

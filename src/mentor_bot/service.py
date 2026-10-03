@@ -289,7 +289,8 @@ class Service:
         return line
 
     async def _deliver_draft(self, username, status, text, ts_iso, kinds, urgent, d: Draft):
-        qid = await self.repo.add_question(username, text, d.text, ts_iso, emb=d.emb, kind=d.kind)
+        qid = await self.repo.add_question(username, text, d.text, ts_iso, emb=d.emb, kind=d.kind,
+                                           emb_model=self._emb_model)
         # ментор читает каждый черновик, поэтому недочищенное не прячем, а подсвечиваем.
         # Пометка «допиши сам» — не ошибка модели, переписывать из-за неё нельзя (выдумает
         # факты), но и уйти ученику она не должна: «Отправить» с ней откажет
@@ -320,16 +321,23 @@ class Service:
         if report is None or not report.items:
             return
         embs = await self.llm.embed([it.question for it in report.items])
-        await self.repo.add_interview_notes(username, ts_iso, report.items, embs)
+        await self.repo.add_interview_notes(username, ts_iso, report.items, embs,
+                                            emb_model=self._emb_model)
         failed = [it.question for it in report.items if it.failed]
         lines = [f"🎯 @{username} про собес: записал вопросов — {len(report.items)}"]
         if failed:
             lines.append("Срезался на: " + "; ".join(q[:80] for q in failed[:5]))
         await self.sender.notify_mentor("\n".join(lines))
 
+    @property
+    def _emb_model(self):
+        return getattr(self.llm, "embed_model", None)
+
     async def _similar_answers(self, emb, k: int = 3):
         """Прошлые вопросы, близкие по смыслу, вместе с тем, что ментор на них ответил."""
-        rows = await self.repo.answered_questions()
+        rows = await self.repo.answered_questions(model=self._emb_model)
+        # старые векторы без метки модели — только той же длины: другие не перемножить
+        rows = [r for r in rows if len(r["emb"]) == len(emb)]
         if not rows:
             return []
         mat = np.array([r["emb"] for r in rows], dtype=np.float32)

@@ -700,3 +700,13 @@ async def test_mentor_reply_while_drafting_drops_the_card(tmp_path):
     llm.draft_reply = slow_draft
     await svc.handle_buffered("ivan", "кто закрывает канал?", "2026-08-20T10:00:00+00:00")
     assert sender.mentor_msgs == [] and await repo.open_questions() == []
+
+
+async def test_changed_embedding_model_does_not_break_similar_answers(tmp_path):
+    repo, sender, kb, llm, svc = await make_triaged(tmp_path, kinds=["tech_question"])
+    old = await repo.add_question("ivan", "как закрыть канал?", "ч", "2026-08-01T10:00:00+00:00",
+                                  emb=[0.1] * 5)           # старый вектор без метки, другой длины
+    await repo.set_question_final(old, "закрывает отправитель")
+    await svc.handle_buffered("ivan", "кто закрывает канал?", TS)
+    assert llm.draft_calls[0]["similar"] == []
+    assert sender.mentor_msgs                                # черновик всё равно пришёл

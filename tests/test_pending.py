@@ -226,6 +226,7 @@ async def test_legacy_json_buffer_survives_upgrade(tmp_path):
     # так буфер лежал до построчного формата
     await repo._exec("INSERT INTO pending(username, last_in_ts, texts) VALUES (?,?,?)",
                      ("ivan", "2026-08-27T10:00:00+00:00", '["привет", "вопрос"]'))
+    await repo._exec("PRAGMA user_version=0")       # база версии до построчного буфера
     await repo.close()
     repo = await Repo.open(path)
     [row] = await repo.mature_pending("2026-08-27T10:05:00+00:00")
