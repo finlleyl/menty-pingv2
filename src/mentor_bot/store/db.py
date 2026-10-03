@@ -20,7 +20,9 @@ CREATE TABLE IF NOT EXISTS messages(
   direction TEXT NOT NULL,
   text TEXT NOT NULL,
   ts TEXT NOT NULL,
-  source TEXT NOT NULL DEFAULT 'chat'
+  source TEXT NOT NULL DEFAULT 'chat',
+  tg_id INTEGER,            -- message_id в Telegram: повторно доставленный апдейт не задвоится
+  reply_to_tg_id INTEGER    -- на какое сообщение чата это ответ
 );
 CREATE INDEX IF NOT EXISTS idx_messages_user_ts ON messages(username, ts);
 CREATE TABLE IF NOT EXISTS pings(
@@ -42,7 +44,8 @@ CREATE TABLE IF NOT EXISTS questions(
   final TEXT,
   emb BLOB,
   kind TEXT NOT NULL DEFAULT 'question',
-  emb_model TEXT
+  emb_model TEXT,
+  msg_ids TEXT              -- JSON: message_id сообщений ученика, из которых собран вопрос
 );
 CREATE INDEX IF NOT EXISTS idx_questions_user_state ON questions(username, state);
 -- style_samples отсекает черновики, ушедшие как есть, сравнением текста — без индекса это скан
@@ -70,7 +73,9 @@ CREATE TABLE IF NOT EXISTS pending_messages(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   username TEXT NOT NULL,
   text TEXT NOT NULL,
-  ts TEXT NOT NULL
+  ts TEXT NOT NULL,
+  tg_id INTEGER,
+  reply_to TEXT             -- на что ученик ответил: «Ментор: …» — контекст для черновика
 );
 CREATE INDEX IF NOT EXISTS idx_pending_messages_user ON pending_messages(username, id);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);

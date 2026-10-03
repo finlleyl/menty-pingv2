@@ -35,9 +35,9 @@ class FakeBot:
         return self.connections[conn_id]
 
 
-def bmsg(text, from_id, bconn="conn1", **kw):
+def bmsg(text, from_id, bconn="conn1", msg_id=1, **kw):
     return Message(
-        message_id=1, date=TS,
+        message_id=msg_id, date=TS,
         chat=Chat(id=111, type="private", username="ivan", first_name="Иван"),
         from_user=User(id=from_id, is_bot=False, first_name="x"),
         text=text, business_connection_id=bconn, **kw,
@@ -111,7 +111,8 @@ async def test_stale_bconn_is_replaced_by_the_new_mentor_connection(tmp_path):
 async def test_burst_on_unknown_connection_asks_telegram_once(tmp_path):
     repo, sender, svc, handle, _ = await router_for(tmp_path, bconn="")
     bot = FakeBot({"conn1": conn()})
-    await asyncio.gather(*(handle(bmsg(f"сообщение {i}", 111), bot=bot) for i in range(4)))
+    await asyncio.gather(*(handle(bmsg(f"сообщение {i}", 111, msg_id=i + 1), bot=bot)
+                           for i in range(4)))
     assert bot.lookups == ["conn1"]
     assert sorted((await repo.get_pending("ivan"))["texts"]) == [f"сообщение {i}" for i in range(4)]
     assert sum("восстановлено" in m for m, _ in sender.mentor_msgs) == 1
@@ -121,7 +122,7 @@ async def test_foreign_connection_is_dropped_and_remembered(tmp_path):
     repo, sender, svc, handle, _ = await router_for(tmp_path, bconn="")
     bot = FakeBot({"alien": conn("alien", owner=555)})
     await handle(bmsg("чужое", 111, bconn="alien"), bot=bot)
-    await handle(bmsg("чужое ещё", 111, bconn="alien"), bot=bot)
+    await handle(bmsg("чужое ещё", 111, bconn="alien", msg_id=2), bot=bot)
     assert not await repo.get_setting("bconn")
     assert await repo.recent_messages("ivan") == []
     assert bot.lookups == ["alien"]                      # второй раз Telegram не спрашиваем
@@ -132,7 +133,7 @@ async def test_unverifiable_connection_alerts_mentor_once(tmp_path):
     repo, sender, svc, handle, _ = await router_for(tmp_path, bconn="")
     bot = FakeBot(error=bad_request())
     await handle(bmsg("привет", 111), bot=bot)
-    await handle(bmsg("ау", 111), bot=bot)
+    await handle(bmsg("ау", 111, msg_id=2), bot=bot)
     assert await repo.recent_messages("ivan") == []
     assert sum("не подтверждает" in m for m, _ in sender.mentor_msgs) == 1
 
@@ -185,3 +186,49 @@ async def test_status_shows_business_connection(tmp_path):
     await repo.set_setting("bconn", "")
     assert "не подключён" in await status_text(svc, repo, Cfg(), TS)
 
+
+
+async def test_redelivered_update_is_processed_once(tmp_path):
+    repo, sender, svc, handle, _ = await router_for(tmp_path)
+    msg = bmsg("как закрыть канал?", 111, msg_id=77)
+    await handle(msg, bot=FakeBot())
+    await handle(msg, bot=FakeBot())                  # Telegram прислал тот же апдейт ещё раз
+    assert (await repo.get_pending("ivan"))["texts"] == ["как закрыть канал?"]
+    assert len(await repo.recent_messages("ivan")) == 1
+
+
+async def test_mentee_reply_carries_the_original_message(tmp_path):
+    repo, sender, svc, handle, _ = await router_for(tmp_path)
+    original = bmsg("Канал закрывает отправитель, получатель читает до закрытия", MENTOR, msg_id=10)
+    await handle(bmsg("а почему именно отправитель?", 111, msg_id=11, reply_to_message=original),
+                 bot=FakeBot())
+    [row] = await repo.mature_pending("2026-08-21T00:00:00+00:00")
+    assert row["replies"] == ["Ментор: «Канал закрывает отправитель, получатель читает до закрытия»"]
+    assert row["tg_ids"] == [11]
+
+
+async def test_quote_wins_over_the_whole_replied_message(tmp_path):
+    from aiogram.types import TextQuote
+    repo, sender, svc, handle, _ = await router_for(tmp_path)
+    original = bmsg("Первое: закрывает отправитель. Второе: nil-канал блокирует навсегда.", MENTOR,
+                    msg_id=10)
+    reply = bmsg("вот это не понял", 111, msg_id=11, reply_to_message=original,
+                 quote=TextQuote(text="nil-канал блокирует навсегда", position=31))
+    await handle(reply, bot=FakeBot())
+    assert (await repo.mature_pending("2026-08-21T00:00:00+00:00"))[0]["replies"] == [
+        "Ментор: «nil-канал блокирует навсегда»"]
+
+
+async def test_mentor_reply_to_a_question_answers_only_that_question(tmp_path):
+    repo, sender, svc, handle, _ = await router_for(tmp_path)
+    q1 = await repo.add_question("ivan", "как закрыть канал?", "ч1", "2026-08-20T08:00:00+00:00",
+                                 msg_ids=[5])
+    q2 = await repo.add_question("ivan", "что такое контекст?", "ч2", "2026-08-20T08:30:00+00:00",
+                                 msg_ids=[6])
+    question = bmsg("как закрыть канал?", 111, msg_id=5)
+    await handle(bmsg("закрывает только отправитель, получатель дочитывает буфер", MENTOR, msg_id=7,
+                      reply_to_message=question), bot=FakeBot())
+    assert (await repo.get_question(q1))["state"] == "answered"
+    assert (await repo.get_question(q1))["final"].startswith("закрывает только отправитель")
+    assert (await repo.get_question(q2))["state"] == "open"     # второй вопрос ждёт своего ответа
+    assert (await repo.get_question(q2))["final"] is None

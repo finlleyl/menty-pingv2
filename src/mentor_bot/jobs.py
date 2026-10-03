@@ -247,7 +247,8 @@ async def drain_pending(service, repo, sender, settings, now_utc: datetime | Non
         texts = row["texts"]
         text = "\n".join(texts)
         try:
-            await service.handle_buffered(username, text, row["last_in_ts"])
+            await service.handle_buffered(username, text, row["last_in_ts"],
+                                          replies=row["replies"], msg_ids=row["tg_ids"])
         except LLMUnavailable as e:
             # провайдер лежит, сообщение не виновато: буфер не трогаем, следующий тик повторит.
             # Остальные буферы упрутся в то же самое — не долбим, ментору одно предупреждение

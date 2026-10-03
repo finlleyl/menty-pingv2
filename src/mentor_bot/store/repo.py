@@ -104,7 +104,21 @@ async def _m3_embeddings(conn):
             await conn.execute(f"UPDATE {table} SET emb=? WHERE id=?", (blob, rid))
 
 
-MIGRATIONS = (_m1_legacy_columns, _m2_pending_rows, _m3_embeddings)
+async def _m4_message_ids(conn):
+    """message_id Telegram: защита от повторно доставленных апдейтов, связь ответа ментора
+    с вопросом по reply и контекст «на что ответил ученик»."""
+    await _add_column(conn, "messages", "tg_id", "INTEGER")
+    await _add_column(conn, "messages", "reply_to_tg_id", "INTEGER")
+    await _add_column(conn, "pending_messages", "tg_id", "INTEGER")
+    await _add_column(conn, "pending_messages", "reply_to", "TEXT")
+    await _add_column(conn, "questions", "msg_ids", "TEXT")
+    await conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_tg ON messages(username, tg_id) "
+        "WHERE tg_id IS NOT NULL"
+    )
+
+
+MIGRATIONS = (_m1_legacy_columns, _m2_pending_rows, _m3_embeddings, _m4_message_ids)
 
 
 class Repo:
@@ -241,11 +255,16 @@ class Repo:
         await self._exec("UPDATE mentees SET unanswered_pings=0 WHERE username=?", (username,))
 
     # messages
-    async def log_message(self, username, direction, text, ts_iso, source=SRC_CHAT):
-        await self._exec(
-            "INSERT INTO messages(username, direction, text, ts, source) VALUES (?,?,?,?,?)",
-            (username, direction, text, ts_iso, source),
+    async def log_message(self, username, direction, text, ts_iso, source=SRC_CHAT,
+                          tg_id=None, reply_to_tg_id=None) -> bool:
+        """False — это сообщение (тот же message_id в том же чате) уже записано: Telegram
+        доставил апдейт повторно, обрабатывать его второй раз нельзя."""
+        cur = await self._exec(
+            "INSERT OR IGNORE INTO messages(username, direction, text, ts, source, tg_id, "
+            "reply_to_tg_id) VALUES (?,?,?,?,?,?,?)",
+            (username, direction, text, ts_iso, source, tg_id, reply_to_tg_id),
         )
+        return cur.rowcount == 1
 
     async def last_message_ts(self, username):
         row = await self._one(
@@ -292,14 +311,25 @@ class Repo:
 
     # questions
     async def add_question(self, username, question, draft, ts_iso, emb=None,
-                           kind=KIND_QUESTION, emb_model=None) -> int:
+                           kind=KIND_QUESTION, emb_model=None, msg_ids=None) -> int:
         cur = await self._exec(
-            "INSERT INTO questions(username, question, draft, created_ts, emb, kind, emb_model) "
-            "VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO questions(username, question, draft, created_ts, emb, kind, emb_model, "
+            "msg_ids) VALUES (?,?,?,?,?,?,?,?)",
             (username, question, draft, ts_iso, pack_emb(emb) if emb is not None else None,
-             kind, emb_model),
+             kind, emb_model, json.dumps(msg_ids) if msg_ids else None),
         )
         return cur.lastrowid
+
+    async def question_for_message(self, username, tg_id):
+        """Вопрос, собранный из сообщения ученика с этим message_id (ментор ответил на него
+        reply-ем). Свежий и ещё без ответа ментора — None, если такого нет."""
+        return await self._one(
+            "SELECT * FROM questions WHERE username=? AND state IN ('open', 'answered') "
+            "AND msg_ids IS NOT NULL "
+            "AND EXISTS (SELECT 1 FROM json_each(questions.msg_ids) WHERE value = ?) "
+            "ORDER BY id DESC LIMIT 1",
+            (username, tg_id),
+        )
 
     async def get_question(self, qid):
         return await self._one("SELECT * FROM questions WHERE id=?", (qid,))
@@ -311,12 +341,18 @@ class Repo:
         """Что в итоге ушло ученику: черновик как есть или правка ментора."""
         await self._exec("UPDATE questions SET final=? WHERE id=?", (final, qid))
 
-    async def record_manual_answer(self, username, text, now_utc):
-        """Ментор ответил в чате сам — это и есть ответ на вопрос.
+    async def record_manual_answer(self, username, text, now_utc, question_id=None):
+        """Ментор ответил в чате сам — это и есть ответ на вопрос. question_id — ответил
+        reply-ем на сообщение этого вопроса: пишем только в него, а не во все за окно.
 
         Короткое «щас гляну» ответом не считаем: вопрос оно закроет (close_open_questions),
         а настоящий ответ, пришедший следом в пределах окна, запишется уже в закрытый вопрос."""
         if len(text.strip()) < MIN_ANSWER_CHARS:
+            return
+        if question_id is not None:
+            await self._exec(
+                "UPDATE questions SET final=? WHERE id=? AND final IS NULL", (text, question_id)
+            )
             return
         since = (now_utc - timedelta(hours=ANSWER_WINDOW_HOURS)).isoformat()
         await self._exec(
@@ -403,7 +439,13 @@ class Repo:
     async def mark_reminded(self, qid):
         await self._exec("UPDATE questions SET reminded=1 WHERE id=?", (qid,))
 
-    async def close_open_questions(self, username):
+    async def close_open_questions(self, username, question_id=None):
+        """question_id — закрыть только этот вопрос (ментор ответил reply-ем на него)."""
+        if question_id is not None:
+            await self._exec(
+                "UPDATE questions SET state='answered' WHERE id=? AND state='open'", (question_id,)
+            )
+            return
         await self._exec(
             "UPDATE questions SET state='answered' WHERE username=? AND state='open'", (username,)
         )
@@ -460,7 +502,7 @@ class Repo:
     # pending — буфер входящих до дебаунса. Окно (last_in_ts) — в pending, сами сообщения —
     # построчно в pending_messages: aiogram разбирает апдейты параллельно, и чтение-изменение-
     # запись одного JSON-списка теряло сообщения, пришедшие пачкой
-    async def buffer_incoming(self, username, text, ts_iso):
+    async def buffer_incoming(self, username, text, ts_iso, tg_id=None, reply_to=None):
         async with self._tx() as c:
             await c.execute(
                 "INSERT INTO pending(username, last_in_ts, texts) VALUES (?,?,'[]') "
@@ -468,8 +510,8 @@ class Repo:
                 (username, ts_iso),
             )
             await c.execute(
-                "INSERT INTO pending_messages(username, text, ts) VALUES (?,?,?)",
-                (username, text, ts_iso),
+                "INSERT INTO pending_messages(username, text, ts, tg_id, reply_to) VALUES (?,?,?,?,?)",
+                (username, text, ts_iso, tg_id, reply_to),
             )
 
     async def touch_pending(self, username, ts_iso):
@@ -513,8 +555,9 @@ class Repo:
             )
 
     async def mature_pending(self, before_iso):
-        """Буферы, в которые ученик не писал с before_iso: [{username, last_in_ts, max_id, texts}].
-        max_id — до какого сообщения снимать после разбора (consume_pending)."""
+        """Буферы, в которые ученик не писал с before_iso: [{username, last_in_ts, max_id, texts,
+        tg_ids, replies}]. max_id — до какого сообщения снимать после разбора (consume_pending);
+        replies — на что ученик отвечал (без повторов), tg_ids — message_id сообщений буфера."""
         # LEFT JOIN: сообщение без строки окна (её успел снять consume) всё равно разберётся
         windows = await self._all(
             "SELECT m.username, MAX(m.id) AS max_id, "
@@ -526,10 +569,13 @@ class Repo:
         )
         for w in windows:
             rows = await self._all(
-                "SELECT text FROM pending_messages WHERE username=? AND id<=? ORDER BY id",
+                "SELECT text, tg_id, reply_to FROM pending_messages WHERE username=? AND id<=? "
+                "ORDER BY id",
                 (w["username"], w["max_id"]),
             )
             w["texts"] = [r["text"] for r in rows]
+            w["tg_ids"] = [r["tg_id"] for r in rows if r["tg_id"] is not None]
+            w["replies"] = list(dict.fromkeys(r["reply_to"] for r in rows if r["reply_to"]))
         return windows
 
     # llm_usage — учёт токенов и денег

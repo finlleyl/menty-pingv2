@@ -124,10 +124,10 @@ async def test_drain_keeps_messages_that_arrived_during_processing(tmp_path):
     repo, sender, svc = await make_svc(tmp_path)
     original = svc.handle_buffered
 
-    async def slow(username, text, ts):
+    async def slow(username, text, ts, **kw):
         # пока идёт запрос в LLM, ученик дописал ещё одно сообщение
         await repo.buffer_incoming(username, "а ещё вопрос", "2026-08-27T10:09:00+00:00")
-        return await original(username, text, ts)
+        return await original(username, text, ts, **kw)
 
     svc.handle_buffered = slow
     await repo.buffer_incoming("ivan", "вопрос", "2026-08-27T10:00:00+00:00")
@@ -141,7 +141,7 @@ async def test_drain_keeps_messages_that_arrived_during_processing(tmp_path):
 async def test_drain_keeps_late_message_even_when_handling_raises(tmp_path):
     repo, sender, svc = await make_svc(tmp_path)
 
-    async def boom(username, text, ts):
+    async def boom(username, text, ts, **kw):
         await repo.buffer_incoming(username, "а ещё вопрос", "2026-08-27T10:09:00+00:00")
         raise RuntimeError("битый ответ")
 
@@ -160,7 +160,7 @@ async def test_drain_keeps_buffer_while_llm_is_down_and_alerts_once(tmp_path):
     repo, sender, svc = await make_svc(tmp_path)
     calls = []
 
-    async def down(username, text, ts):
+    async def down(username, text, ts, **kw):
         calls.append(username)
         raise LLMUnavailable("401 account_deactivated")
 
@@ -184,10 +184,10 @@ async def test_drain_announces_recovery_and_rearms_alert(tmp_path):
     original = svc.handle_buffered
     state = {"down": True}
 
-    async def flaky(username, text, ts):
+    async def flaky(username, text, ts, **kw):
         if state["down"]:
             raise LLMUnavailable("502")
-        return await original(username, text, ts)
+        return await original(username, text, ts, **kw)
 
     svc.handle_buffered = flaky
     await repo.buffer_incoming("ivan", "вопрос", "2026-08-27T10:00:00+00:00")

@@ -19,6 +19,25 @@ NO_REPLY_HINT = (
 ALERT_KEY = "alerted_bconn_unverified"
 
 
+REPLY_SNIPPET = 300   # сколько текста исходного сообщения брать в контекст ответа
+
+
+def reply_context(message: Message, mentor_user_id: int) -> str | None:
+    """«Ментор: «…»» — на что ученик ответил reply-ем или цитатой. Без этого «а почему так?»
+    непонятно, о чём: ответить могли на сообщение недельной давности."""
+    src = message.reply_to_message
+    if src is None:
+        return None
+    text = (message.quote.text if message.quote else None) or src.text or src.caption or ""
+    text = " ".join(text.split())
+    if not text:
+        return None   # ответили на стикер или голосовое — пересказать нечего
+    mine = src.sender_business_bot is not None or (
+        src.from_user is not None and src.from_user.id == mentor_user_id)
+    cut = text[:REPLY_SNIPPET] + ("…" if len(text) > REPLY_SNIPPET else "")
+    return f"{'Ментор' if mine else 'Ученик'}: «{cut}»"
+
+
 def can_reply(conn: BusinessConnection) -> bool:
     """Может ли бот писать от имени ментора. В Bot API 9 право лежит в rights, раньше —
     в can_reply самого подключения."""
@@ -139,26 +158,28 @@ def make_router(service, repo, mentor_user_id: int) -> Router:
         if not username:
             return  # без username в таблицу не привязать; ученики ментора все с @
 
+        tg_id = message.message_id
         if outgoing and message.is_from_offline:
             # автоответ Business («меня нет», приветствие) или отложенное сообщение: в переписку
             # пишем, но ответом ментора не считаем — иначе «меня нет» снесло бы буфер с вопросом
             if username in service.by_username:
                 await repo.log_message(username, "out", text or "[медиа]", ts_iso,
-                                       source=SRC_AUTO)
+                                       source=SRC_AUTO, tg_id=tg_id)
             return
 
         if not text:
             if username not in service.by_username:
                 return  # неизвестный менти прислал медиа без текста — не за что зацепиться
             await repo.upsert_mentee(username, chat_id=peer.id)
-            await service.on_contact_only(username, direction, ts_iso)
+            await service.on_contact_only(username, direction, ts_iso, tg_id=tg_id)
             return
 
         if username not in service.by_username:
             if await repo.get_setting(f"ignore_chat:{username}") == "1":
                 return
             # фиксируем сообщение сразу, чтобы не потерять контакт при рассинхроне кэша
-            await repo.log_message(username, direction, text, ts_iso)
+            if not await repo.log_message(username, direction, text, ts_iso, tg_id=tg_id):
+                return  # повторная доставка апдейта — второй раз не спрашиваем
             if await repo.get_mentee(username) is None:
                 await repo.upsert_mentee(username, chat_id=peer.id)
                 await service.on_unknown_chat(username, peer.full_name or username)
@@ -167,8 +188,11 @@ def make_router(service, repo, mentor_user_id: int) -> Router:
             return
         await repo.upsert_mentee(username, chat_id=peer.id)
         if outgoing:
-            await service.on_outgoing(username, text, ts_iso)
+            reply_to = message.reply_to_message
+            await service.on_outgoing(username, text, ts_iso, tg_id=tg_id,
+                                      reply_to_tg_id=reply_to.message_id if reply_to else None)
         else:
-            await service.on_incoming(username, text, ts_iso)
+            await service.on_incoming(username, text, ts_iso, tg_id=tg_id,
+                                      reply_to=reply_context(message, mentor_user_id))
 
     return router

@@ -19,6 +19,8 @@ class Triage(BaseModel):
     needs_reply: bool
     urgent: bool               # хочет бросить, тяжёлое выгорание, паника, беда в жизни
     milestone: Literal["none", "sprint_finished", "legend_ready"]
+    # вопрос, понятный без переписки: по нему ищем в материалах курса и похожие ответы
+    search_query: str
 
 
 class StatusUpdate(BaseModel):
@@ -71,7 +73,12 @@ TRIAGE_SYS = (
     "(1, 2, 3 или 4), а собеседования по нему ещё не было; закончил урок, тему или задачу — "
     "это НЕ sprint_finished. Если в переписке ментор уже написал, что спринт сдан или принят, "
     "«сдал!» ученика — это win, milestone=none. "
-    "legend_ready — говорит, что легенда готова или дописана. Иначе none."
+    "legend_ready — говорит, что легенда готова или дописана. Иначе none.\n"
+    "search_query: если в новых сообщениях есть вопрос (tech_question или org_question), "
+    "перепиши его одной фразой так, чтобы он был понятен без переписки: подставь из контекста, "
+    "о чём речь («а почему так?» после разговора о select → «почему select с default не "
+    "блокируется»). Это запрос для поиска по материалам курса: без приветствий, эмоций и имён. "
+    "Вопросов нет — пустая строка."
 )
 
 STATUS_SYS = (
@@ -285,6 +292,14 @@ def _chunk_text(c) -> str:
     return f"[Источник: {c['source']}]\n{c['text']}" if c.get("source") else c["text"]
 
 
+def _replies(replies) -> str:
+    """Сообщения, на которые ученик ответил reply-ем или цитатой: без них «а почему так?»
+    непонятно, о чём, даже с перепиской — ответить могли на что-то давнее."""
+    if not replies:
+        return ""
+    return "Ученик отвечает на сообщение:\n" + "\n".join(replies) + "\n\n"
+
+
 def _dialog(recent: list[dict]) -> str:
     return "\n".join(f"{'Ученик' if m['direction'] == 'in' else 'Ментор'}: {m['text']}" for m in recent)
 
@@ -348,11 +363,13 @@ class LLM:
         await self._record(task, model, resp)
         return resp.choices[0].message.parsed
 
-    async def triage(self, text: str, recent=None, status: str | None = None) -> Triage:
+    async def triage(self, text: str, recent=None, status: str | None = None,
+                     replies=None) -> Triage:
         """Что в новых сообщениях ученика: вопросы, эмоции, успех, смена этапа — сразу всё."""
         user = (
             f"Текущий статус ученика в таблице: «{status or 'нет'}»\n\n"
             f"Переписка до новых сообщений:\n{_dialog(recent or []) or 'нет'}\n\n"
+            f"{_replies(replies)}"
             f"НОВЫЕ сообщения ученика:\n{text}"
         )
         return await self._parse(self.fast, TRIAGE_SYS, user, Triage, "triage")
@@ -401,7 +418,7 @@ class LLM:
     async def draft_reply(self, text, kinds, *, recent=None, stage_label=None, status=None,
                           notes=None, profile=None, chunks=None, similar=None, examples=None,
                           samples=None, call=None, urgent=False, ongoing=False,
-                          avoid=None) -> str:
+                          avoid=None, replies=None) -> str:
         """Один черновик на всё новое от ученика: вопросы, переживания, успехи.
 
         chunks=None — вопросов нет: материалы курса не искали и в промпт не кладём вовсе.
@@ -413,6 +430,7 @@ class LLM:
             ongoing="Диалог уже идёт: не начинай с «Привет».\n" if ongoing else "",
         )
         user = (
+            f"{_replies(replies)}"
             f"Новые сообщения ученика:\n{text}\n\n"
             f"Что в них: {', '.join(KIND_LABELS.get(k, k) for k in kinds)}\n"
             f"Этап ученика: {stage_label or 'неизвестен'} (статус в таблице: «{status or 'нет'}»)\n"

@@ -1,3 +1,4 @@
+import json
 from datetime import date
 
 import pytest
@@ -43,20 +44,22 @@ _LEGACY_KINDS = {"question": ["tech_question"], "progress": ["status_change"], "
 
 class FakeLLM:
     def __init__(self, kind="other", status=None, *, kinds=None, needs_reply=None,
-                 urgent=False, milestone="none", drafts=None):
+                 urgent=False, milestone="none", drafts=None, search_query=""):
         self.kinds = kinds or _LEGACY_KINDS[kind]
         self.needs_reply = (needs_reply if needs_reply is not None else any(
             k in ("tech_question", "org_question", "feelings", "win") for k in self.kinds))
         self.urgent = urgent
         self.milestone = milestone
+        self.search_query = search_query
         self.status = status or StatusUpdate(new_status=None, confidence="low")
         self.drafts = list(drafts or [])      # очередь ответов draft_reply; пусто — эхо
         self.triage_calls, self.draft_calls, self.status_calls = [], [], []
 
-    async def triage(self, text, recent=None, status=None):
-        self.triage_calls.append({"text": text, "recent": recent, "status": status})
+    async def triage(self, text, recent=None, status=None, replies=None):
+        self.triage_calls.append({"text": text, "recent": recent, "status": status,
+                                  "replies": replies})
         return Triage(kinds=self.kinds, needs_reply=self.needs_reply, urgent=self.urgent,
-                      milestone=self.milestone)
+                      milestone=self.milestone, search_query=self.search_query)
 
     async def parse_status(self, text, current):
         self.status_calls.append(text)
@@ -710,3 +713,37 @@ async def test_changed_embedding_model_does_not_break_similar_answers(tmp_path):
     await svc.handle_buffered("ivan", "кто закрывает канал?", TS)
     assert llm.draft_calls[0]["similar"] == []
     assert sender.mentor_msgs                                # черновик всё равно пришёл
+
+
+async def test_follow_up_question_is_searched_by_the_rewritten_query(tmp_path):
+    repo, sender, kb, llm, svc = await make_triaged(
+        tmp_path, kinds=["tech_question"], search_query="почему select с default не блокируется")
+    embedded = []
+    embed = llm.embed
+
+    async def spy(texts):
+        embedded.extend(texts)
+        return await embed(texts)
+
+    llm.embed = spy
+    await svc.handle_buffered("ivan", "а почему так?", TS, msg_ids=[41, 42])
+    assert kb.calls == ["почему select с default не блокируется"]
+    assert embedded == ["почему select с default не блокируется"]
+    [q] = await repo.open_questions()
+    assert q["question"] == "а почему так?"                 # ментору — слова ученика как есть
+    assert json.loads(q["msg_ids"]) == [41, 42]
+
+
+async def test_feelings_without_question_do_not_use_search_query(tmp_path):
+    repo, sender, kb, llm, svc = await make_triaged(tmp_path, kinds=["feelings"], search_query="")
+    await svc.handle_buffered("ivan", "чёт приуныл", TS)
+    assert kb.calls == []
+
+
+async def test_reply_context_reaches_triage_draft_and_card(tmp_path):
+    repo, sender, kb, llm, svc = await make_triaged(tmp_path, kinds=["tech_question"])
+    replies = ["Ментор: «Канал закрывает отправитель»"]
+    await svc.handle_buffered("ivan", "а почему?", TS, replies=replies)
+    assert llm.triage_calls[0]["replies"] == replies
+    assert llm.draft_calls[0]["replies"] == replies
+    assert "↩️ Ментор: «Канал закрывает отправитель»" in sender.mentor_msgs[0][0]

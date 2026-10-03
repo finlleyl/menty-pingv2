@@ -137,9 +137,10 @@ class Service:
             await self.sheets.set_date(m, msg_date)
             m.last_date = msg_date
 
-    async def on_contact_only(self, username: str, direction: str, ts_iso: str):
+    async def on_contact_only(self, username: str, direction: str, ts_iso: str, tg_id=None):
         """Медиа без текста: фиксируем контакт без классификации."""
-        await self.repo.log_message(username, direction, "[медиа]", ts_iso)
+        if not await self.repo.log_message(username, direction, "[медиа]", ts_iso, tg_id=tg_id):
+            return  # Telegram доставил апдейт повторно
         await self.repo.reset_unanswered(username)
         try:
             await self._touch_sheet_date(username, ts_iso)
@@ -151,12 +152,21 @@ class Service:
         else:
             await self.repo.drop_pending(username)
 
-    async def on_outgoing(self, username: str, text: str, ts_iso: str):
-        await self.repo.log_message(username, "out", text, ts_iso)
+    async def on_outgoing(self, username: str, text: str, ts_iso: str, tg_id=None,
+                          reply_to_tg_id=None):
+        if not await self.repo.log_message(username, "out", text, ts_iso, tg_id=tg_id,
+                                           reply_to_tg_id=reply_to_tg_id):
+            return  # Telegram доставил апдейт повторно
         await self.repo.reset_unanswered(username)
+        # ответил reply-ем на сообщение вопроса — это ответ ровно на него: остальные вопросы
+        # ученика остаются открытыми, и чужой ответ в них не попадёт
+        q = (await self.repo.question_for_message(username, reply_to_tg_id)
+             if reply_to_tg_id is not None else None)
+        qid = q["id"] if q else None
         # ответ ментора своими словами — лучший пример для будущих черновиков
-        await self.repo.record_manual_answer(username, text, datetime.fromisoformat(ts_iso))
-        await self.repo.close_open_questions(username)
+        await self.repo.record_manual_answer(username, text, datetime.fromisoformat(ts_iso),
+                                             question_id=qid)
+        await self.repo.close_open_questions(username, question_id=qid)
         # ментор ответил сам — накопленное обрабатывать не нужно, ждущий пинг тоже
         await self.repo.drop_pending(username)
         await self.repo.close_ping_drafts(username)
@@ -181,8 +191,11 @@ class Service:
             return
         await self._propose(username, m, upd.new_status, text, f"Ты написал @{username}")
 
-    async def on_incoming(self, username: str, text: str, ts_iso: str):
-        await self.repo.log_message(username, "in", text, ts_iso)
+    async def on_incoming(self, username: str, text: str, ts_iso: str, tg_id=None,
+                          reply_to=None):
+        """reply_to — на что ученик ответил reply-ем или цитатой («Ментор: …»)."""
+        if not await self.repo.log_message(username, "in", text, ts_iso, tg_id=tg_id):
+            return  # Telegram доставил апдейт повторно
         await self.repo.reset_unanswered(username)
         try:
             await self._touch_sheet_date(username, ts_iso)
@@ -192,15 +205,17 @@ class Service:
         # ученик вышел на связь — пинг, ждущий одобрения, больше не нужен
         await self.repo.close_ping_drafts(username)
         # LLM здесь НЕ дёргаем: копим в буфер, обработает drain_pending
-        await self.repo.buffer_incoming(username, text, ts_iso)
+        await self.repo.buffer_incoming(username, text, ts_iso, tg_id=tg_id, reply_to=reply_to)
 
-    async def handle_buffered(self, username: str, text: str, ts_iso: str):
-        """Разбор накопленного за окно дебаунса. Вызывается джобом drain_pending."""
+    async def handle_buffered(self, username: str, text: str, ts_iso: str, replies=None,
+                              msg_ids=None):
+        """Разбор накопленного за окно дебаунса. Вызывается джобом drain_pending.
+        replies — на что ученик отвечал reply-ем; msg_ids — message_id сообщений буфера."""
         m = self.by_username.get(username)
         status = m.status if m else None
         recent = await self.repo.recent_messages(username, limit=DIALOG_LIMIT * 3)
         prior = _prior_dialog(recent, text)[-DIALOG_LIMIT:]
-        tri = await self.llm.triage(text, prior, status)
+        tri = await self.llm.triage(text, prior, status, replies=replies)
         kinds = _kinds(tri)
         # все запросы к модели — до первого сообщения ментору: если провайдер упадёт посередине,
         # буфер повторится целиком, и черновик с предложением статуса не задвоятся
@@ -215,7 +230,8 @@ class Service:
         draft = None
         wants_reply = tri.needs_reply or tri.urgent or tri.milestone != "none"
         if wants_reply and any(k in REPLY_KINDS for k in kinds):
-            draft = await self._compose_draft(username, m, text, ts_iso, tri, kinds, prior)
+            draft = await self._compose_draft(username, m, text, ts_iso, tri, kinds, prior,
+                                              replies)
             # пока модель писала, ментор мог ответить в чате сам — карточка уже не нужна, а вопрос,
             # заведённый после его ответа, так и висел бы открытым
             last_out = await self.repo.last_out_ts(username)
@@ -224,7 +240,8 @@ class Service:
                 draft = None
         try:
             if draft is not None:
-                await self._deliver_draft(username, status, text, ts_iso, kinds, tri.urgent, draft)
+                await self._deliver_draft(username, status, text, ts_iso, kinds, tri.urgent, draft,
+                                          replies=replies, msg_ids=msg_ids)
         finally:
             # Telegram отверг черновик — предложение статуса («беру паузу») всё равно нужно:
             # сбой в соседнем шаге его не отменяет
@@ -241,7 +258,8 @@ class Service:
             except Exception:
                 log.exception("interview extraction failed for %s", username)
 
-    async def _compose_draft(self, username, m, text, ts_iso, tri, kinds, prior) -> Draft:
+    async def _compose_draft(self, username, m, text, ts_iso, tri, kinds, prior,
+                             replies=None) -> Draft:
         """Черновик ответа: генерация → проверка кодом → при нарушении одна переписка."""
         status = m.status if m else None
         stage = parse_stage(status)
@@ -255,7 +273,11 @@ class Service:
         question = any(k in TECH_KINDS for k in kinds)
         group = KIND_QUESTION if question else KIND_HUMAN
         ongoing = _ongoing(prior, text, ts_iso)
-        emb = (await self.llm.embed([text]))[0]
+        # «а почему так?» в базе знаний ничего не найдёт — ищем по вопросу, который разбор
+        # переписал понятным без переписки. По нему же сравниваем с прошлыми вопросами
+        query = (tri.search_query or "").strip() if question else ""
+        query = query or text
+        emb = (await self.llm.embed([query]))[0]
         samples = await self.repo.style_samples()
         similar = await self._similar_answers(emb)
         ctx = dict(
@@ -263,9 +285,9 @@ class Service:
             notes=m.notes if m else None, profile=await self.repo.get_profile(username),
             # на «устал» или «сдал!» базу знаний не ищем вовсе: поиск всегда что-то вернёт,
             # и модель притянет к настроению пять случайных кусков про Go
-            chunks=self.kb.search(text, emb, k=5) if question else None,
+            chunks=self.kb.search(query, emb, k=5) if question else None,
             similar=similar, examples=await self.repo.edit_examples(5, kind=group),
-            samples=samples, call=call, urgent=tri.urgent, ongoing=ongoing,
+            samples=samples, call=call, urgent=tri.urgent, ongoing=ongoing, replies=replies,
         )
         reply = await self.llm.draft_reply(text, kinds, **ctx)
         problems = draft_problems(reply, kinds, call, ongoing, samples)
@@ -288,9 +310,10 @@ class Service:
                 line += f" · на стадии {days} дн."
         return line
 
-    async def _deliver_draft(self, username, status, text, ts_iso, kinds, urgent, d: Draft):
+    async def _deliver_draft(self, username, status, text, ts_iso, kinds, urgent, d: Draft,
+                             replies=None, msg_ids=None):
         qid = await self.repo.add_question(username, text, d.text, ts_iso, emb=d.emb, kind=d.kind,
-                                           emb_model=self._emb_model)
+                                           emb_model=self._emb_model, msg_ids=msg_ids)
         # ментор читает каждый черновик, поэтому недочищенное не прячем, а подсвечиваем.
         # Пометка «допиши сам» — не ошибка модели, переписывать из-за неё нельзя (выдумает
         # факты), но и уйти ученику она не должна: «Отправить» с ней откажет
@@ -298,6 +321,9 @@ class Service:
         warn = f"\n\n⚠️ проверь: {'; '.join(warns)}" if warns else ""
         note = f"\n\n(учтено твоих прошлых ответов на похожее: {d.similar})" if d.similar else ""
         head = _header(username, kinds, urgent)
+        if replies:
+            # на что ученик ответил — иначе «а почему так?» в карточке не понять без чата
+            head += "".join(f"\n↩️ {r[:200]}" for r in replies[:2])
         tail = (f"{await self._stage_line(username, status, ts_iso)}"
                 f"\n\nЧЕРНОВИК:\n{d.text}{warn}{note}")
         # ученик вставил лог на 3 тыс. символов — Telegram отверг бы всё сообщение. Полный

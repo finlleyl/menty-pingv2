@@ -1,7 +1,9 @@
 from mentor_bot.llm import LLM, PlainText, StatusUpdate, Triage
 
-SMALLTALK = Triage(kinds=["smalltalk"], needs_reply=False, urgent=False, milestone="none")
-TECH = Triage(kinds=["tech_question"], needs_reply=True, urgent=False, milestone="none")
+SMALLTALK = Triage(kinds=["smalltalk"], needs_reply=False, urgent=False, milestone="none",
+                   search_query="")
+TECH = Triage(kinds=["tech_question"], needs_reply=True, urgent=False, milestone="none",
+              search_query="как работает select в Go")
 
 
 class FakeCompletions:
@@ -321,3 +323,15 @@ def test_status_prompt_leaves_learning_stages_to_the_mentor():
     assert "двигает только ментор" in STATUS_SYS
     assert "закончил/сдал спринт" in STATUS_SYS
     assert "НЕ status_change" in TRIAGE_SYS
+
+
+async def test_triage_sees_the_replied_message_and_asks_for_a_search_query():
+    fake = FakeClient([TECH])
+    llm = LLM("k", "smart", "fast", "emb", client=fake)
+    tri = await llm.triage("а почему так?", [], "3 спринт",
+                           replies=["Ментор: «select с default не блокируется»"])
+    assert tri.search_query == "как работает select в Go"
+    system, user = (m["content"] for m in fake.chat.completions.calls[0]["messages"])
+    assert "search_query" in system and "понятен без переписки" in system
+    assert "Ученик отвечает на сообщение:\nМентор: «select с default не блокируется»" in user
+    assert user.rstrip().endswith("а почему так?")
