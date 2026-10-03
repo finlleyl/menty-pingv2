@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 from aiogram import F, Router
 from aiogram.types import CallbackQuery
 
-from mentor_bot.cards import NOOP, hhmm
+from mentor_bot.cards import NOOP, UNCERTAIN_LABEL, hhmm
 from mentor_bot.sheets import RowNotFound, SheetSchemaChanged, StatusConflict
 from mentor_bot.store.repo import SRC_BOT, SRC_BOT_EDIT, UNTIL_REPLY
 from mentor_bot.style import todo_marks
@@ -25,13 +25,29 @@ async def _log_sent(repo, username: str, text: str, source: str):
 
 
 # итог на карточке, если её кнопку нажали, когда запись уже закрыта (в том числе карточки,
-# отправленные до живых карточек): старые кнопки убираем, чтобы не путали
+# отправленные до живых карточек): старые кнопки убираем, чтобы не путали.
+# 'sending' здесь нет: отправка ещё идёт и может сорваться — тогда кнопки снова нужны
 _DONE = {
     "sent": "✅ Отправлено", "dry": "🧪 Dry-run", "answered": "💬 Ответил в чате",
     "ignored": "🙈 Игнор", "stale": "⏭ Неактуален", "skipped": "⏭ Пропущен",
-    "expired": "⌛ Истёк", "sending": "⏳ Отправляется", "handoff": "➡️ Отправь сам",
+    "expired": "⌛ Истёк", "handoff": "➡️ Отправь сам",
     "sent_manual": "✅ Отправил сам", "snoozed": "⏸ Отложен",
+    "uncertain": UNCERTAIN_LABEL,
 }
+SENDING = "Уже отправляется — подожди пару секунд"
+
+
+def _claim_lost(rec) -> str:
+    """Запись забрали между чтением и claim: чаще всего — первое нажатие, реже — её закрыл
+    ответ в чате. rec — запись, перечитанная после неудачного claim."""
+    return SENDING if rec and rec["state"] == "sending" else "Уже обработано"
+
+
+async def _close_both(sender, label, username, stored, pressed):
+    """Итог на карточке записи. Нажали на её устаревшую копию (карточку заменили новой,
+    а старая почему-то осталась с кнопками) — закрываем и её."""
+    for msg_id in dict.fromkeys(m for m in (stored, pressed) if m):
+        await sender.close_card(msg_id, label, username)
 
 
 def _tz(service) -> str:
@@ -48,9 +64,13 @@ async def handle_q_callback(data: str, repo, sender, service, card=None) -> str:
     q = await repo.get_question(int(qid))
     if not q:
         return "Уже обработано"
-    card = q.get("card_msg_id") or card
+    pressed, card = card, q.get("card_msg_id") or card
+    if q["state"] == "sending":
+        return SENDING   # первое нажатие ещё отправляет — карточку не трогаем
     if q["state"] != "open":
-        await sender.close_card(card, _DONE.get(q["state"], "✔️ Обработано"), q["username"])
+        # закрываем ту, что нажали: текущую карточку записи итогом устаревшей не затираем
+        await sender.close_card(pressed or card, _DONE.get(q["state"], "✔️ Обработано"),
+                                q["username"])
         return "Уже обработано"
     if action == "edit":
         await start_edit(repo, "q", q["id"])
@@ -66,7 +86,7 @@ async def handle_q_callback(data: str, repo, sender, service, card=None) -> str:
             # ответ на нажатие — всплывашка до 200 символов
             return f"В черновике осталась пометка {marks[0][:120]} - нажми ✏️ Править"
         if not await repo.claim("questions", q["id"]):
-            return "Уже обработано"   # второе быстрое нажатие
+            return _claim_lost(await repo.get_question(q["id"]))   # второе быстрое нажатие
         try:
             result = await sender.send_to_mentee(q["username"], q["draft"])
         except Exception:
@@ -79,12 +99,12 @@ async def handle_q_callback(data: str, repo, sender, service, card=None) -> str:
             if result == "sent":
                 await _log_sent(repo, q["username"], q["draft"], SRC_BOT)
             label = f"✅ Отправлено {hhmm(_tz(service))}" if result == "sent" else "🧪 Dry-run: ушло тебе"
-            await sender.close_card(card, label, q["username"])
+            await _close_both(sender, label, q["username"], card, pressed)
             return "Отправлено" if result == "sent" else "Dry-run: ушло тебе"
         await repo.set_question_state(q["id"], "open")
         return f"Не отправлено: {result}"
     await repo.set_question_state(q["id"], "ignored")
-    await sender.close_card(card, "🙈 Игнор", q["username"])
+    await _close_both(sender, "🙈 Игнор", q["username"], card, pressed)
     return "Ок, игнорирую"
 
 
@@ -206,10 +226,14 @@ async def handle_p_callback(data: str, repo, sender, service, card=None) -> str:
     d = await repo.get_ping_draft(int(pid))
     if not d:
         return "Уже обработано"
-    card = d.get("card_msg_id") or card
+    pressed, card = card, d.get("card_msg_id") or card
     user = d["username"]
+    if d["state"] == "sending":
+        return SENDING
     if d["state"] not in ("open", "handoff") or (d["state"] == "handoff" and action in ("send", "edit")):
-        await sender.close_card(card, _DONE.get(d["state"], "✔️ Обработано"), user)
+        # «Отправить» со старой карточки одобрения, когда пинг уже передан тебе: закрываем
+        # нажатую, а карточку «отправь сам» с кнопкой копирования оставляем как есть
+        await sender.close_card(pressed or card, _DONE.get(d["state"], "✔️ Обработано"), user)
         return "Уже обработано"
     now = datetime.now(timezone.utc)
     if action in ("skip", "snooze"):
@@ -222,12 +246,12 @@ async def handle_p_callback(data: str, repo, sender, service, card=None) -> str:
         await repo.set_ping_draft_state(d["id"], "skipped" if action == "skip" else "snoozed")
         day = until.astimezone(ZoneInfo(_tz(service))).strftime("%d.%m")
         label = f"⏭ Пропущен до {day}" if action == "skip" else f"⏸ До {day}"
-        await sender.close_card(card, label, user)
+        await _close_both(sender, label, user, card, pressed)
         return f"Ок, следующий пинг @{user} не раньше {day}"
     if action == "until":
         await repo.set_pause(user, UNTIL_REPLY)
         await repo.set_ping_draft_state(d["id"], "snoozed")
-        await sender.close_card(card, "🔕 До ответа ученика", user)
+        await _close_both(sender, "🔕 До ответа ученика", user, card, pressed)
         return f"Ок, @{user} не пингую, пока сам не напишет"
     if action == "edit":
         await start_edit(repo, "p", d["id"])
@@ -236,7 +260,7 @@ async def handle_p_callback(data: str, repo, sender, service, card=None) -> str:
         )
         return "Жду текст"
     return (await send_ping_draft(d["id"], service, repo, sender, service.settings,
-                                  card=card)).message
+                                  card=card, pressed=pressed)).message
 
 
 async def handle_esc_callback(data: str, repo, sender, service, card=None) -> str:

@@ -29,6 +29,8 @@ log = logging.getLogger(__name__)
 # Пинг, который ждёт ментора (на одобрении или «отправь сам»), живёт двое суток: забытый
 # черновик раньше навсегда блокировал пинги ученику — новый не готовился, пока висит старый
 PING_DRAFT_TTL = timedelta(hours=48)
+# записи в pings о карточках, которые ждали ментора: одобрение и «отправь сам»
+CARD_PINGS = ("review", "handoff")
 
 
 async def ping_cycle(service, repo, sender, llm, settings, now_utc: datetime | None = None):
@@ -43,10 +45,10 @@ async def ping_cycle(service, repo, sender, llm, settings, now_utc: datetime | N
     except Exception as e:
         log.exception("sheet sync failed")
         # раз в час одно и то же — шум: одно предупреждение, пока таблица не прочитается
-        await alert_once(repo, sender, "sheet_sync",
+        await alert_once(repo, sender, "sheet_sync:ping",
                          f"⚠️ Не могу прочитать таблицу ({type(e).__name__}) — пинги на паузе")
         return
-    await alert_once(repo, sender, "sheet_sync", "")
+    await alert_once(repo, sender, "sheet_sync:ping", "")
 
     for d in await repo.expire_ping_drafts((now_utc - PING_DRAFT_TTL).isoformat()):
         await sender.close_card(d["card_msg_id"], "⌛ Истёк", d["username"])
@@ -83,6 +85,11 @@ async def ping_cycle(service, repo, sender, llm, settings, now_utc: datetime | N
             last_ping_local = datetime.fromisoformat(last_ping).astimezone(tz).date()
             if last_ping_local == now_utc.astimezone(tz).date():
                 continue  # уже пинговали сегодня — не чаще 1 пинга в сутки
+        last_card = await repo.last_ping_ts(username, statuses=CARD_PINGS)
+        if last_card and now_utc - parse_iso_utc(last_card) < timedelta(days=settings.ping_interval_days):
+            # карточку ты не тронул, она истекла — новая не раньше обычного интервала:
+            # иначе каждые двое суток приходил бы новый пинг тому же молчуну
+            continue
 
         dry = await sender.is_dryrun()
         if not dry:
@@ -183,14 +190,19 @@ def ping_draft_kb(pid: int, username: str | None = None) -> InlineKeyboardMarkup
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-# у кнопки «скопировать» Telegram ограничивает текст 256 символами
+# у кнопки «скопировать» Telegram ограничивает текст 256 символами — в UTF-16, как и все
+# длины в Bot API: эмодзи вне BMP (😅, 🚀) считаются за два
 COPY_LIMIT = 256
+
+
+def fits_copy(text: str) -> bool:
+    return len(text.encode("utf-16-le")) // 2 <= COPY_LIMIT
 
 
 def handoff_kb(pid: int, username: str, text: str) -> InlineKeyboardMarkup:
     """Пинг, который ментор отправляет сам: скопировать текст, открыть чат, отложить."""
     rows = []
-    if len(text) <= COPY_LIMIT:
+    if fits_copy(text):
         rows.append([InlineKeyboardButton(text="📋 Скопировать текст",
                                           copy_text=CopyTextButton(text=text))])
     rows += [open_chat_row(username), _snooze_row(pid),
@@ -205,13 +217,14 @@ async def hand_over_ping(username, m, text, service, repo, sender, settings, now
     из режима одобрения, который превращается в такую карточку."""
     if pid is None:
         pid = await repo.add_ping_draft(username, text, now_utc.isoformat())
+        await repo.set_ping_draft_state(pid, "handoff")
     else:
-        await repo.set_ping_draft_text(pid, text)
-    await repo.set_ping_draft_state(pid, "handoff")
+        # срок жизни карточки — с момента выдачи, а не с создания черновика на одобрение
+        await repo.hand_over_ping_draft(pid, text, now_utc.isoformat())
     await repo.log_ping(username, now_utc.isoformat(), "handoff")
     stage = parse_stage(m.status)
     silent = f", молчит {silent_days} дн." if silent_days else ""
-    copy_hint = "скопируй кнопкой и открой чат" if len(text) <= COPY_LIMIT else "скопируй и открой чат"
+    copy_hint = "скопируй кнопкой и открой чат" if fits_copy(text) else "скопируй и открой чат"
     msg = await sender.notify_mentor(
         f"📨 Пинг для @{username} ({STAGE_LABELS[stage]}{silent}) — отправь сам.\n"
         f"Бот написать не может: Telegram пускает его только в чаты, где ученик писал за "
@@ -265,19 +278,28 @@ class DraftOutcome:
 
 
 async def send_ping_draft(pid, service, repo, sender, settings, text=None,
-                          now_utc: datetime | None = None, card=None) -> DraftOutcome:
+                          now_utc: datetime | None = None, card=None,
+                          pressed=None) -> DraftOutcome:
     """Отправка одобренного пинга: как есть (text=None) или в редакции ментора.
-    card — message_id нажатой карточки, если в записи его нет (карточки старых версий)."""
+    card — message_id карточки, если в записи его нет (карточки старых версий);
+    pressed — нажатая карточка, если это устаревшая копия: закроется вместе с текущей."""
     now_utc = now_utc or datetime.now(timezone.utc)
     d = await repo.get_ping_draft(pid)
+    if d and d["state"] == "sending":
+        return DraftOutcome("Уже отправляется — подожди пару секунд")
     if not d or d["state"] != "open":
         return DraftOutcome("Уже обработано")
     username = d["username"]
     card = d.get("card_msg_id") or card
+    cards = list(dict.fromkeys(c for c in (card, pressed) if c))
+
+    async def close_cards(label):
+        for c in cards:
+            await sender.close_card(c, label, username)
 
     async def close(state, label):
         await repo.set_ping_draft_state(pid, state)
-        await sender.close_card(card, label, username)
+        await close_cards(label)
 
     last_in = await repo.last_in_ts(username)
     if last_in and parse_iso_utc(last_in) > parse_iso_utc(d["created_ts"]):
@@ -296,7 +318,10 @@ async def send_ping_draft(pid, service, repo, sender, settings, text=None,
         await close("stale", "⏸ Сейчас пинговать нельзя")
         return DraftOutcome(f"@{username} сейчас пинговать нельзя (пауза, стоп-статус или игнор) — не отправляю")
     if not await repo.claim("ping_drafts", pid):
-        return DraftOutcome("Уже обработано")   # второе быстрое нажатие
+        # второе быстрое нажатие — или пинг успел закрыться (ученик написал сам)
+        fresh = await repo.get_ping_draft(pid)
+        return DraftOutcome("Уже отправляется — подожди пару секунд"
+                            if fresh and fresh["state"] == "sending" else "Уже обработано")
     edited = bool(text)
     text = text or d["text"]
     await repo.log_ping(username, now_utc.isoformat(), "attempt")
@@ -308,7 +333,7 @@ async def send_ping_draft(pid, service, repo, sender, settings, text=None,
         return DraftOutcome("Ошибка отправки", retry=True)
     if result == "window_closed":
         # на этой карточке остался текст модели, а уйти может твоя правка — новая карточка
-        await sender.close_card(card, "➡️ Отправь сам — карточка ниже", username)
+        await close_cards("➡️ Отправь сам — карточка ниже")
         await hand_over_ping(username, m, text, service, repo, sender, settings, now_utc, pid=pid)
         return DraftOutcome(f"Бот не может написать @{username} сам — отправь вручную, "
                             f"текст в карточке ниже")
@@ -318,7 +343,7 @@ async def send_ping_draft(pid, service, repo, sender, settings, text=None,
     await repo.set_ping_draft_state(pid, result)
     label = ("🧪 Dry-run: ушло тебе" if result == "dry"
              else f"{'✏️ Ушёл твой пинг' if edited else '✅ Пинг ушёл'} {hhmm(settings.tz_name, now_utc)}")
-    await sender.close_card(card, label, username)
+    await close_cards(label)
     await after_ping(result, username, m, text, service, repo, sender, settings, now_utc,
                      source=SRC_BOT_EDIT if edited else SRC_BOT)
     return DraftOutcome(f"Пинг @{username} отправлен" if result == "sent" else "Dry-run: ушло тебе")
@@ -392,9 +417,12 @@ async def dossier_cycle(service, repo, llm, sender, settings, now_utc: datetime 
         await service.sync_mentees()
     except Exception as e:
         log.exception("sheet sync failed")
-        await alert_once(repo, sender, "sheet_sync",
+        # ключ свой, не общий с пингами: иначе успешный синк в цикле пингов «снимал»
+        # проблему досье, и следующий сбой ночью приходил как новый — и наоборот
+        await alert_once(repo, sender, "sheet_sync:dossier",
                          f"⚠️ Не могу прочитать таблицу ({type(e).__name__}) — досье не обновляю")
         return
+    await alert_once(repo, sender, "sheet_sync:dossier", "")
 
     errors = 0
     for username in await repo.stale_profiles():

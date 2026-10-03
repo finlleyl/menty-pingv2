@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher
 
+from mentor_bot.cards import UNCERTAIN_LABEL
 from mentor_bot.config import load_settings
 from mentor_bot.jobs import (
     backup_db, digest_cycle, dossier_cycle, drain_pending, ping_cycle, remind_cycle,
@@ -28,8 +29,7 @@ async def main():
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
     repo = await Repo.open(settings.db_path)
-    if released := await repo.release_stuck():
-        log.warning("released %d records stuck in 'sending' after restart", released)
+    stuck = await repo.release_stuck()
     sheets = SheetsClient(settings.google_sa_path, settings.spreadsheet_id,
                           settings.active_sheet_titles, overrides=settings.header_overrides)
     llm = LLM(
@@ -43,6 +43,11 @@ async def main():
     bot = Bot(token=settings.bot_token)
     sender = Sender(bot, repo, settings.mentor_user_id)
     service = Service(repo, sheets, llm, sender, kb, settings)
+    if stuck:
+        try:
+            await report_stuck(stuck, sender)
+        except Exception:
+            log.exception("stuck sends report failed")
     try:
         await business.check_connection(bot, repo, sender, settings.mentor_user_id)
     except Exception:
@@ -149,8 +154,37 @@ async def main():
         # без этого после падения polling оставался жив поток aiosqlite: процесс не выходил,
         # и Docker с restart: unless-stopped не перезапускал мёртвого бота
         scheduler.shutdown(wait=False)
+        await finish_in_flight()
         await repo.close()
         await bot.session.close()
+
+
+# docker stop ждёт 10 секунд до SIGKILL — успеваем дописать начатое
+SHUTDOWN_GRACE = 8
+
+
+async def finish_in_flight(timeout: float = SHUTDOWN_GRACE):
+    """Дать доработать начатому: нажатию «Отправить», задаче пинга. Без этого asyncio.run
+    отменял их на любом await — в том числе между отправкой ученику и записью «ушло»,
+    и после рестарта бот не знал, отправлено ли сообщение."""
+    others = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+    if not others:
+        return
+    log.info("waiting for %d in-flight tasks", len(others))
+    _, pending = await asyncio.wait(others, timeout=timeout)
+    if pending:
+        log.warning("%d tasks still running after %ss — cancelling", len(pending), timeout)
+
+
+async def report_stuck(rows, sender):
+    """Отправки, прерванные падением: карточки — итогом «проверь чат», ментору — список."""
+    for r in rows:
+        await sender.close_card(r.get("card_msg_id"), UNCERTAIN_LABEL, r["username"])
+    users = ", ".join(sorted({f"@{r['username']}" for r in rows}))
+    await sender.notify_mentor(
+        f"⚠️ Бот перезапустился посреди отправки ({users}). Ушло ли сообщение — неизвестно: "
+        f"проверь чат, повторно сам не отправляю"
+    )
 
 
 if __name__ == "__main__":

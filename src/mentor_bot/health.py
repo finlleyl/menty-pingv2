@@ -31,9 +31,15 @@ async def alert_once(repo, sender, key: str, text: str):
     prev = await repo.get_setting(f"alert:{key}", "")
     if text == prev:
         return
-    await repo.set_setting(f"alert:{key}", text)
     if text:
-        await sender.notify_mentor(text)
+        try:
+            await sender.notify_mentor(text)
+        except Exception:
+            # не дошло (сеть, лимит Telegram) — не запоминаем: иначе следующая попытка
+            # сочла бы, что ментор уже предупреждён, и он так и не узнал бы о проблеме
+            log.warning("alert %s not delivered", key, exc_info=True)
+            return
+    await repo.set_setting(f"alert:{key}", text)
 
 
 def tracked(name: str, fn, repo, sender):

@@ -278,3 +278,43 @@ async def test_status_write_refused_on_broken_sheet_header_keeps_the_proposal(tm
     out = await handle_st_callback(f"st:yes:{pid}", repo, sender, svc)
     assert out == "Не пишу в таблицу: пропала колонка статуса"
     assert await repo.get_proposal(pid) is not None         # нажмёшь, когда починишь шапку
+
+
+async def test_second_press_while_sending_keeps_the_card_buttons(tmp_path):
+    """Второе нажатие, пока первое ещё отправляет, карточку не закрывает: отправка может
+    сорваться, и тогда кнопки снова нужны."""
+    from mentor_bot.routers.callbacks import handle_p_callback
+    repo, sheets, sender, svc = await make(tmp_path)
+    qid = await repo.add_question("ivan", "вопрос", "черновик", "2026-08-19T10:00:00+00:00")
+    await repo.set_card("questions", qid, 70)
+    assert await repo.claim("questions", qid)                  # первое нажатие в полёте
+    out = await handle_q_callback(f"q:send:{qid}", repo, sender, svc, card=70)
+    assert out.startswith("Уже отправляется") and sender.closed_cards == []
+    await repo.set_question_state(qid, "open")                 # первая отправка сорвалась
+    assert "Отправлено" in await handle_q_callback(f"q:send:{qid}", repo, sender, svc, card=70)
+    pid = await repo.add_ping_draft("ivan", "пинг", "2026-08-19T10:00:00+00:00")
+    assert await repo.claim("ping_drafts", pid)
+    for action in ("send", "skip"):
+        out = await handle_p_callback(f"p:{action}:{pid}", repo, sender, svc, card=71)
+        assert out.startswith("Уже отправляется")
+    assert all(c != 71 for c, _ in sender.closed_cards)
+
+
+async def test_press_on_a_stale_card_does_not_close_the_current_one(tmp_path):
+    """«Отправить» на старой карточке одобрения, когда пинг уже передан тебе: закрывается
+    нажатая, а карточка «отправь сам» с кнопкой копирования остаётся рабочей."""
+    from mentor_bot.routers.callbacks import handle_p_callback
+    repo, sheets, sender, svc = await make(tmp_path)
+    pid = await repo.add_ping_draft("ivan", "пинг", "2026-08-19T10:00:00+00:00")
+    await repo.set_ping_draft_state(pid, "handoff")
+    await repo.set_card("ping_drafts", pid, 81)                 # текущая: «отправь сам»
+    out = await handle_p_callback(f"p:send:{pid}", repo, sender, svc, card=80)
+    assert out == "Уже обработано" and sender.closed_cards == [(80, "➡️ Отправь сам")]
+    await handle_p_callback(f"p:snooze:{pid}:3", repo, sender, svc, card=80)
+    assert {c for c, _ in sender.closed_cards[1:]} == {80, 81}  # действие — итог на обеих
+    qid = await repo.add_question("ivan", "вопрос", "черновик", "2026-08-19T10:00:00+00:00")
+    await repo.set_card("questions", qid, 91)
+    await repo.set_question_state(qid, "sent")
+    sender.closed_cards.clear()
+    await handle_q_callback(f"q:ign:{qid}", repo, sender, svc, card=90)
+    assert sender.closed_cards == [(90, "✅ Отправлено")]

@@ -62,3 +62,19 @@ async def test_fails_ignore_vectors_of_another_length(tmp_path):
     text = await fails_text(repo, model="new")
     assert "про каналы" in text and "старый вопрос" not in text
     await repo.close()
+
+
+async def test_fails_keep_current_model_vectors_after_switching_models(tmp_path):
+    """Старых векторов без метки больше, чем свежих: по самой частой длине выпали бы как раз
+    новые записи, а сводка показывала бы только старьё."""
+    from types import SimpleNamespace
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    item = lambda q: SimpleNamespace(company=None, stage=None, question=q, failed=True)
+    await repo.add_interview_notes("a", "2026-07-01T10:00:00+00:00",
+                                   [item("старый 1"), item("старый 2"), item("старый 3")],
+                                   [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+    await repo.add_interview_notes("b", "2026-09-01T10:00:00+00:00", [item("свежий")],
+                                   [[1.0, 0.0, 0.0]], emb_model="new")
+    out = await fails_text(repo, model="new")
+    assert "свежий" in out and "старый" not in out
+    await repo.close()

@@ -183,7 +183,9 @@ class Service:
                 await self.alert_once("date_write", f"⚠️ Не могу записать даты в таблицу "
                                                     f"({type(e).__name__}) — проверь доступ")
                 return
+            # записалось — значит и шапку починили: следующая поломка снова придёт
             await self.alert_once("date_write", "")
+            await self.alert_once(f"schema:{m.sheet_title}", "")
             m.last_date = msg_date
 
     async def count_ping(self, username: str, ts_iso: str):
@@ -201,15 +203,16 @@ class Service:
 
     async def _mentor_wrote(self, username: str, ts_iso: str):
         """Ментор написал ученику сам. Ждала карточка «отправь сам» — это и есть пинг: его
-        считаем, а счётчик игнора не обнуляем, иначе стоп после N пингов не сработал бы."""
+        считаем. Счётчик игнора обнуляет только ответ ученика: сообщение ментора — не ответ,
+        и «ну что там?» после пинга раньше сбрасывало счёт, стоп после N пингов не срабатывал.
+        Карточка «отправь сам» закрывается, как только ученик напишет (в том числе медиа), —
+        значит, раз она ещё ждёт, ученик после неё молчал."""
         handed = await self.repo.close_ping_drafts(username, state="sent_manual",
                                                    states=("handoff",))
         if handed:
             await self.count_ping(username, ts_iso)
             await self.close_cards(handed, f"✅ Отправил сам {hhmm(self.settings.tz_name)}",
                                    username)
-        else:
-            await self.repo.reset_unanswered(username)
         await self.close_cards(await self.repo.close_ping_drafts(username), "💬 Ответил в чате",
                                username)
 
@@ -217,26 +220,36 @@ class Service:
         """Медиа без текста: фиксируем контакт без классификации."""
         if not await self.repo.log_message(username, direction, "[медиа]", ts_iso, tg_id=tg_id):
             return  # Telegram доставил апдейт повторно
-        if direction == "out":
-            await self._mentor_wrote(username, ts_iso)   # голосовое ментора — тоже ответ
-        else:
-            await self.repo.reset_unanswered(username)
-            await self.repo.clear_reply_pause(username)
-        await self._touch_sheet_date(username, ts_iso)
         if direction == "in":
             # ученик ещё пишет — продлеваем окно дебаунса, если буфер уже открыт
             await self.repo.touch_pending(username, ts_iso)
+            await self._mentee_wrote(username)   # голосовое или стикер — тоже ответ
         else:
             await self.repo.drop_pending(username)
+            await self._mentor_wrote(username, ts_iso)   # голосовое ментора — тоже ответ
+            await self.close_cards(await self.repo.close_open_questions(username),
+                                   "💬 Ответил в чате", username)
+        await self._touch_sheet_date(username, ts_iso)
+
+    async def _mentee_wrote(self, username: str):
+        """Ученик вышел на связь: счётчик игнора и пауза «до ответа» своё отработали, а пинг,
+        ждущий одобрения или ручной отправки, больше не нужен."""
+        await self.repo.reset_unanswered(username)
+        await self.repo.clear_reply_pause(username)
+        await self.close_cards(await self.repo.close_ping_drafts(username),
+                               "⏭ Ученик написал сам", username)
 
     async def on_outgoing(self, username: str, text: str, ts_iso: str, tg_id=None,
                           reply_to_tg_id=None):
         if not await self.repo.log_message(username, "out", text, ts_iso, tg_id=tg_id,
                                            reply_to_tg_id=reply_to_tg_id):
             return  # Telegram доставил апдейт повторно
+        # ментор ответил сам — накопленное обрабатывать не нужно
+        await self.repo.drop_pending(username)
         await self._mentor_wrote(username, ts_iso)
-        # ответил reply-ем на сообщение вопроса — это ответ ровно на него: остальные вопросы
-        # ученика остаются открытыми, и чужой ответ в них не попадёт
+        # ответил reply-ем на сообщение вопроса — это ответ ровно на него, даже если вопрос
+        # уже закрыт: остальные вопросы ученика остаются открытыми, и чужой ответ в них
+        # не попадёт. Reply на что-то другое («спасибо») — обычный ответ в чате
         q = (await self.repo.question_for_message(username, reply_to_tg_id)
              if reply_to_tg_id is not None else None)
         qid = q["id"] if q else None
@@ -244,8 +257,6 @@ class Service:
         await self.repo.record_manual_answer(username, text, datetime.fromisoformat(ts_iso),
                                              question_id=qid)
         closed = await self.repo.close_open_questions(username, question_id=qid)
-        # ментор ответил сам — накопленное обрабатывать не нужно
-        await self.repo.drop_pending(username)
         await self.close_cards(closed, "💬 Ответил в чате", username)
         await self._touch_sheet_date(username, ts_iso)
         if looks_like_verdict(text):
@@ -266,17 +277,14 @@ class Service:
 
     async def on_incoming(self, username: str, text: str, ts_iso: str, tg_id=None,
                           reply_to=None):
-        """reply_to — на что ученик ответил reply-ем или цитатой («Ментор: …»)."""
-        if not await self.repo.log_message(username, "in", text, ts_iso, tg_id=tg_id):
+        """reply_to — на что ученик ответил reply-ем или цитатой («Ментор: …»).
+        LLM здесь НЕ дёргаем: копим в буфер, обработает drain_pending. В буфер — сразу, вместе
+        с записью в переписку: упади что-то ниже, сообщение уже не потеряется."""
+        if not await self.repo.log_incoming(username, text, ts_iso, tg_id=tg_id,
+                                            reply_to=reply_to):
             return  # Telegram доставил апдейт повторно
-        await self.repo.reset_unanswered(username)
-        await self.repo.clear_reply_pause(username)
+        await self._mentee_wrote(username)
         await self._touch_sheet_date(username, ts_iso)
-        # ученик вышел на связь — пинг, ждущий одобрения или ручной отправки, больше не нужен
-        await self.close_cards(await self.repo.close_ping_drafts(username),
-                               "⏭ Ученик написал сам", username)
-        # LLM здесь НЕ дёргаем: копим в буфер, обработает drain_pending
-        await self.repo.buffer_incoming(username, text, ts_iso, tg_id=tg_id, reply_to=reply_to)
 
     async def handle_buffered(self, username: str, text: str, ts_iso: str, replies=None,
                               msg_ids=None):

@@ -24,19 +24,21 @@ def _days(x: float) -> str:
     return f"{x:.0f} дн."
 
 
-def _same_dim(rows):
-    """Векторы одной длины — самой частой. После смены модели эмбеддингов старые записи
-    без метки иной длины, и кластеризация на них упала бы."""
+def _same_dim(rows, model=None):
+    """Векторы одной длины. После смены модели эмбеддингов старые записи без метки иной
+    длины, и кластеризация на них упала бы. Длина — та, что у текущей модели: по самой
+    частой сразу после смены остались бы старые векторы, а свежие выпали бы из сводки."""
     if not rows:
         return rows
-    dims = Counter(len(r["emb"]) for r in rows)
+    current = [len(r["emb"]) for r in rows if model and r.get("emb_model") == model]
+    dims = Counter(current or [len(r["emb"]) for r in rows])
     dim = dims.most_common(1)[0][0]
     return [r for r in rows if len(r["emb"]) == dim]
 
 
 async def fails_text(repo, since_iso: str | None = None, top: int = 10, model=None) -> str:
     rows = _same_dim(await repo.interview_questions(failed_only=True, since_iso=since_iso,
-                                                    model=model))
+                                                    model=model), model)
     if not rows:
         return "Провалов на собесах пока не записано"
     groups = cluster([r["emb"] for r in rows], FAIL_CLUSTER_MIN)

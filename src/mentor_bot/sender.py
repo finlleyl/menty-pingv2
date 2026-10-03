@@ -1,4 +1,3 @@
-import asyncio
 import logging
 
 from aiogram.exceptions import TelegramBadRequest
@@ -68,5 +67,4 @@ class Sender:
             if any(code in str(e) for code in WINDOW_ERRORS):
                 return "window_closed"
             raise
-        await asyncio.sleep(2)
         return "sent"

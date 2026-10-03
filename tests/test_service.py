@@ -206,9 +206,10 @@ async def test_outgoing_updates_and_alerts_on_sheet_failure(tmp_path):
 
     sheets.set_date = boom
     await svc.on_outgoing("ivan", "привет", "2026-08-19T10:00:00+00:00")
-    # сообщение залогировано, счётчик сброшен, ментор получил алерт, бот не упал
+    # сообщение залогировано, ментор получил алерт, бот не упал. Счётчик игнора не тронут:
+    # сообщение ментора — не ответ ученика, иначе стоп после N пингов не сработал бы
     assert (await repo.last_message_ts("ivan")) == "2026-08-19T10:00:00+00:00"
-    assert (await repo.get_mentee("ivan"))["unanswered_pings"] == 0
+    assert (await repo.get_mentee("ivan"))["unanswered_pings"] == 1
     assert any("⚠️" in m[0] for m in sender.mentor_msgs)
 
 
@@ -830,3 +831,58 @@ async def test_draft_mentioning_another_mentee_is_flagged(tmp_path):
     await svc.handle_buffered("ivan", "застрял на каналах", TS)
     assert llm.draft_calls[1]["avoid"] == ["чужой ученик: @petr_dev"]
     assert "⚠️ проверь: чужой ученик: @petr_dev" in sender.mentor_msgs[0][0]
+
+
+async def test_reply_to_an_already_closed_question_touches_only_that_question(tmp_path):
+    """Ответ reply-ем на сообщение уже закрытого вопроса — ответ на него, а не повод закрыть
+    остальные открытые и записать в них чужой ответ."""
+    repo, sheets, sender, svc = await make(tmp_path)
+    old = await repo.add_question("ivan", "про каналы", "ч", "2026-08-19T10:00:00+00:00", msg_ids=[5])
+    await repo.set_question_state(old, "ignored")
+    new = await repo.add_question("ivan", "про мапы", "ч2", "2026-08-19T10:10:00+00:00", msg_ids=[6])
+    answer = "закрывает канал отправитель, а получатель дочитывает буфер до конца"
+    await svc.on_outgoing("ivan", answer, "2026-08-19T10:20:00+00:00", tg_id=50, reply_to_tg_id=5)
+    assert (await repo.get_question(old))["final"] == answer
+    q2 = await repo.get_question(new)
+    assert q2["state"] == "open" and q2["final"] is None
+
+
+async def test_mentor_voice_reply_closes_open_drafts(tmp_path):
+    repo, sheets, sender, svc = await make(tmp_path)
+    qid = await repo.add_question("ivan", "вопрос", "ч", "2026-08-19T10:00:00+00:00")
+    await repo.set_card("questions", qid, 90)
+    await svc.on_contact_only("ivan", "out", "2026-08-19T10:05:00+00:00", tg_id=3)
+    assert (await repo.get_question(qid))["state"] == "answered"
+    assert (90, "💬 Ответил в чате") in sender.closed_cards
+
+
+async def test_incoming_is_buffered_even_if_what_follows_fails(tmp_path):
+    """Отметка «уже записано» и буфер — одной транзакцией: упади что-то ниже, повторная
+    доставка апдейта — дубль, но сообщение уже в буфере, а не потеряно."""
+    repo, sheets, sender, svc = await make(tmp_path)
+
+    async def boom(*a, **kw):
+        raise RuntimeError("db hiccup")
+
+    svc._mentee_wrote = boom
+    with pytest.raises(RuntimeError):
+        await svc.on_incoming("ivan", "вопрос", "2026-08-19T10:00:00+00:00", tg_id=7)
+    await svc.on_incoming("ivan", "вопрос", "2026-08-19T10:00:00+00:00", tg_id=7)   # повтор
+    assert (await repo.get_pending("ivan"))["texts"] == ["вопрос"]
+
+
+async def test_fixed_header_clears_the_schema_alert(tmp_path):
+    from mentor_bot.sheets import SheetSchemaChanged
+    repo, sheets, sender, svc = await make(tmp_path)
+    real = sheets.set_date
+
+    async def broken(m, d):
+        raise SheetSchemaChanged("A", "пропала колонка «Дата»")
+
+    sheets.set_date = broken
+    await svc.on_incoming("ivan", "привет", "2026-08-19T10:00:00+00:00", tg_id=1)
+    sheets.set_date = real
+    await svc.on_incoming("ivan", "ау", "2026-08-20T10:00:00+00:00", tg_id=2)     # починили
+    sheets.set_date = broken
+    await svc.on_incoming("ivan", "эй", "2026-08-21T10:00:00+00:00", tg_id=3)     # сломали снова
+    assert len([t for t, _ in sender.mentor_msgs if "Лист «A»" in t]) == 2

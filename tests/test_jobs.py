@@ -613,3 +613,78 @@ async def test_unreadable_sheet_alerts_once_not_every_hour(tmp_path):
     for hour in range(3):
         await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC + timedelta(hours=hour))
     assert len([t for t, _ in sender.mentor_msgs if "Не могу прочитать таблицу" in t]) == 1
+
+
+async def test_mentee_media_reply_closes_the_handoff_so_mentor_answer_is_not_a_ping(tmp_path):
+    """Ученик ответил голосовым — карточка «отправь сам» больше не нужна, и следующее
+    сообщение ментора — разговор, а не пинг без ответа."""
+    repo, sheets, sender, llm, svc = await make_closed(tmp_path)
+    await svc.sync_mentees()
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC)
+    card = (await repo.open_ping_draft("ivan"))["card_msg_id"]
+    await svc.on_contact_only("ivan", "in", "2026-08-20T12:10:00+00:00", tg_id=7)
+    assert await repo.open_ping_draft("ivan") is None
+    assert (card, "⏭ Ученик написал сам") in sender.closed_cards
+    await svc.on_outgoing("ivan", "о, привет! рад слышать", "2026-08-20T12:15:00+00:00", tg_id=8)
+    assert (await repo.get_mentee("ivan"))["unanswered_pings"] == 0
+
+
+async def test_mentor_follow_up_after_a_ping_does_not_reset_the_ignore_counter(tmp_path):
+    repo, sheets, sender, llm, svc = await make(tmp_path)
+    await _live(repo)
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC)
+    assert (await repo.get_mentee("ivan"))["unanswered_pings"] == 1
+    await svc.on_outgoing("ivan", "ну что там?", "2026-08-20T18:00:00+00:00", tg_id=11)
+    assert (await repo.get_mentee("ivan"))["unanswered_pings"] == 1   # это не ответ ученика
+    await svc.on_incoming("ivan", "тут я", "2026-08-20T19:00:00+00:00", tg_id=12)
+    assert (await repo.get_mentee("ivan"))["unanswered_pings"] == 0
+
+
+async def test_handoff_from_review_lives_48h_from_the_handover(tmp_path):
+    repo, sheets, sender, llm, svc = await make_closed(tmp_path)
+    await svc.sync_mentees()
+    await repo.set_setting("ping_mode", "review")
+    drafted = NOON_UTC - timedelta(hours=26)                  # черновик пролежал больше суток
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=drafted)
+    d = await repo.open_ping_draft("ivan")
+    await jobs_mod.send_ping_draft(d["id"], svc, repo, sender, Cfg2(), now_utc=NOON_UTC)
+    handed = await repo.get_ping_draft(d["id"])
+    assert handed["state"] == "handoff" and handed["created_ts"] == NOON_UTC.isoformat()
+    # от черновика прошло 49 часов, от выдачи карточки — 23: карточка жива
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC + timedelta(hours=23))
+    assert (await repo.get_ping_draft(d["id"]))["state"] == "handoff"
+
+
+async def test_untouched_card_is_not_reissued_before_the_usual_interval(tmp_path):
+    repo, sheets, sender, llm, svc = await make_closed(tmp_path)
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC)       # «отправь сам»
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC + timedelta(hours=49))
+    assert await repo.open_ping_draft("ivan") is None                        # истекла
+    assert len(llm.gen_ping_calls) == 1                                      # новой ещё нет
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC + timedelta(days=3))
+    assert len(llm.gen_ping_calls) == 2
+
+
+def test_copy_button_limit_counts_utf16_units():
+    from mentor_bot.jobs import COPY_LIMIT, fits_copy
+    assert fits_copy("а" * COPY_LIMIT)
+    assert fits_copy("😅" * (COPY_LIMIT // 2))
+    assert not fits_copy("😅" * (COPY_LIMIT // 2 + 1))     # 129 символов, но 258 единиц UTF-16
+
+
+async def test_ping_and_dossier_sheet_alerts_do_not_overwrite_each_other(tmp_path):
+    """Общий ключ: «пинги на паузе» и «досье не обновляю» затирали друг друга, и после
+    ночного сбоя досье каждый часовой цикл пингов присылал предупреждение заново."""
+    from mentor_bot.jobs import dossier_cycle
+    repo, sheets, sender, llm, svc = await make(tmp_path)
+
+    async def down():
+        raise RuntimeError("503")
+
+    sheets.load_mentees = down
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC)
+    await dossier_cycle(svc, repo, llm, sender, Cfg2(), now_utc=NOON_UTC)
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC + timedelta(hours=1))
+    await dossier_cycle(svc, repo, llm, sender, Cfg2(), now_utc=NOON_UTC + timedelta(days=1))
+    alerts = [t for t, _ in sender.mentor_msgs if "Не могу прочитать таблицу" in t]
+    assert len(alerts) == 2

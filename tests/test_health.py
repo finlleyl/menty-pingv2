@@ -52,12 +52,59 @@ def test_catch_up_only_jobs_that_already_ran_and_missed_their_slot():
     assert due_catch_ups(runs, NOW) == ["nightly_backup"]
 
 
-async def test_records_stuck_in_sending_are_released_on_start(tmp_path):
+async def test_send_interrupted_by_restart_is_not_reopened_and_mentor_checks_chat(tmp_path):
+    """Упали между «Отправить» и итогом: ушло ли — неизвестно. Вернуть в 'open' значило бы
+    дать отправить второй раз; помечаем 'uncertain', карточку закрываем, ментору — список."""
+    from mentor_bot.cards import UNCERTAIN_LABEL
+    from mentor_bot.main import report_stuck
     repo = await Repo.open(str(tmp_path / "t.db"))
     qid = await repo.add_question("ivan", "вопрос", "черновик", NOW.isoformat())
-    assert await repo.claim("questions", qid)
-    assert await repo.release_stuck() == 1
-    assert (await repo.get_question(qid))["state"] == "open"
+    await repo.set_card("questions", qid, 501)
+    pid = await repo.add_ping_draft("petr", "пинг", NOW.isoformat())
+    assert await repo.claim("questions", qid) and await repo.claim("ping_drafts", pid)
+    stuck = await repo.release_stuck()
+    assert {(r["table"], r["id"]) for r in stuck} == {("questions", qid), ("ping_drafts", pid)}
+    assert (await repo.get_question(qid))["state"] == "uncertain"
+    assert (await repo.get_ping_draft(pid))["state"] == "uncertain"
+    assert not await repo.claim("questions", qid)             # второй отправки не будет
+    assert await repo.release_stuck() == []
+    sender = FakeSender()
+    await report_stuck(stuck, sender)
+    assert (501, UNCERTAIN_LABEL) in sender.closed_cards
+    [(text, _)] = sender.mentor_msgs
+    assert "@ivan" in text and "@petr" in text and "проверь чат" in text
+    await repo.close()
+
+
+async def test_finish_in_flight_lets_started_work_complete():
+    import asyncio
+    from mentor_bot.main import finish_in_flight
+    done = []
+
+    async def sending():
+        await asyncio.sleep(0.05)
+        done.append("logged")
+
+    task = asyncio.create_task(sending())
+    await finish_in_flight(timeout=1)
+    assert done == ["logged"] and task.done()
+
+
+async def test_undelivered_alert_is_retried_next_time(tmp_path):
+    """notify_mentor упал — алерт не запоминаем, иначе ментор так и не узнал бы о проблеме."""
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    sender = FakeSender()
+    real = sender.notify_mentor
+
+    async def flaky(text, reply_markup=None):
+        raise RuntimeError("telegram down")
+
+    sender.notify_mentor = flaky
+    await alert_once(repo, sender, "k", "A")
+    assert await repo.get_setting("alert:k", "") == ""
+    sender.notify_mentor = real
+    await alert_once(repo, sender, "k", "A")
+    assert [t for t, _ in sender.mentor_msgs] == ["A"]
     await repo.close()
 
 

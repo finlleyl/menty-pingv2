@@ -287,6 +287,21 @@ class Repo:
         )
         return cur.rowcount == 1
 
+    async def log_incoming(self, username, text, ts_iso, tg_id=None, reply_to=None) -> bool:
+        """Сообщение ученика — в переписку и в буфер разбора одной транзакцией. Порознь
+        отметка «уже записано» могла лечь без буфера (сбой между записями), и повторная
+        доставка того же апдейта сообщение уже не спасала: оно терялось. False — дубль."""
+        async with self._tx() as c:
+            cur = await c.execute(
+                "INSERT OR IGNORE INTO messages(username, direction, text, ts, source, tg_id) "
+                "VALUES (?, 'in', ?, ?, ?, ?)",
+                (username, text, ts_iso, SRC_CHAT, tg_id),
+            )
+            if cur.rowcount != 1:
+                return False
+            await self._buffer(c, username, text, ts_iso, tg_id, reply_to)
+        return True
+
     async def last_message_ts(self, username):
         row = await self._one(
             "SELECT ts FROM messages WHERE username=? ORDER BY ts DESC LIMIT 1", (username,)
@@ -324,10 +339,13 @@ class Repo:
             "INSERT INTO pings(username, ts, status) VALUES (?,?,?)", (username, ts_iso, status)
         )
 
-    async def last_ping_ts(self, username):
-        row = await self._one(
-            "SELECT ts FROM pings WHERE username=? ORDER BY ts DESC LIMIT 1", (username,)
-        )
+    async def last_ping_ts(self, username, statuses=None):
+        """statuses — только записи с этими статусами ('review', 'handoff', ...)."""
+        sql, args = "SELECT ts FROM pings WHERE username=?", [username]
+        if statuses:
+            sql += f" AND status IN ({','.join('?' * len(statuses))})"
+            args += list(statuses)
+        row = await self._one(sql + " ORDER BY ts DESC LIMIT 1", tuple(args))
         return row["ts"] if row else None
 
     # questions
@@ -343,10 +361,10 @@ class Repo:
 
     async def question_for_message(self, username, tg_id):
         """Вопрос, собранный из сообщения ученика с этим message_id (ментор ответил на него
-        reply-ем). Свежий и ещё без ответа ментора — None, если такого нет."""
+        reply-ем), в любом состоянии: reply на уже закрытый вопрос — всё равно ответ на него,
+        а не повод закрыть остальные. None — сообщение ни в один вопрос не входило."""
         return await self._one(
-            "SELECT * FROM questions WHERE username=? AND state IN ('open', 'answered') "
-            "AND msg_ids IS NOT NULL "
+            "SELECT * FROM questions WHERE username=? AND msg_ids IS NOT NULL "
             "AND EXISTS (SELECT 1 FROM json_each(questions.msg_ids) WHERE value = ?) "
             "ORDER BY id DESC LIMIT 1",
             (username, tg_id),
@@ -538,15 +556,19 @@ class Repo:
     # запись одного JSON-списка теряло сообщения, пришедшие пачкой
     async def buffer_incoming(self, username, text, ts_iso, tg_id=None, reply_to=None):
         async with self._tx() as c:
-            await c.execute(
-                "INSERT INTO pending(username, last_in_ts, texts) VALUES (?,?,'[]') "
-                "ON CONFLICT(username) DO UPDATE SET last_in_ts=MAX(last_in_ts, excluded.last_in_ts)",
-                (username, ts_iso),
-            )
-            await c.execute(
-                "INSERT INTO pending_messages(username, text, ts, tg_id, reply_to) VALUES (?,?,?,?,?)",
-                (username, text, ts_iso, tg_id, reply_to),
-            )
+            await self._buffer(c, username, text, ts_iso, tg_id, reply_to)
+
+    @staticmethod
+    async def _buffer(c, username, text, ts_iso, tg_id, reply_to):
+        await c.execute(
+            "INSERT INTO pending(username, last_in_ts, texts) VALUES (?,?,'[]') "
+            "ON CONFLICT(username) DO UPDATE SET last_in_ts=MAX(last_in_ts, excluded.last_in_ts)",
+            (username, ts_iso),
+        )
+        await c.execute(
+            "INSERT INTO pending_messages(username, text, ts, tg_id, reply_to) VALUES (?,?,?,?,?)",
+            (username, text, ts_iso, tg_id, reply_to),
+        )
 
     async def touch_pending(self, username, ts_iso):
         """Продлить окно, не добавляя текст (медиа без подписи). Нет буфера — no-op."""
@@ -654,16 +676,16 @@ class Repo:
             "waiting_pings": pings["n"], "last_chat": chat["ts"],
         }
 
-    async def release_stuck(self) -> int:
-        """После рестарта: «Отправить» нажали, а бот упал до итога — запись так и висела в
-        'sending', и кнопка отвечала «Уже обработано». На старте в полёте ничего нет —
-        возвращаем такие записи в 'open', кнопки снова работают."""
-        async with self._tx() as c:
-            n = 0
-            for table in ("questions", "ping_drafts"):
-                cur = await c.execute(f"UPDATE {table} SET state='open' WHERE state='sending'")
-                n += cur.rowcount
-        return n
+    async def release_stuck(self) -> list[dict]:
+        """После рестарта: «Отправить» нажали, а бот упал до итога — запись висела в 'sending'.
+        Ушло сообщение или нет, неизвестно: вернуть в 'open' — значит позволить отправить его
+        второй раз. Помечаем 'uncertain' и отдаём записи — ментор проверит чат сам.
+        Возвращает [{table, id, card_msg_id, username}]."""
+        out = []
+        for table in ("questions", "ping_drafts"):
+            out += [dict(r, table=table)
+                    for r in await self._close(table, "uncertain", "1=1", (), states=("sending",))]
+        return out
 
     # llm_usage — учёт токенов и денег
     async def log_usage(self, ts_iso, task, model, prompt_tokens, completion_tokens, cost):
@@ -710,6 +732,14 @@ class Repo:
 
     async def set_ping_draft_text(self, pid, text):
         await self._exec("UPDATE ping_drafts SET text=? WHERE id=?", (text, pid))
+
+    async def hand_over_ping_draft(self, pid, text, ts_iso):
+        """Черновик с одобрения → «отправь сам». Срок жизни карточки — с этого момента:
+        со старым created_ts она истекала через пару часов после выдачи."""
+        await self._exec(
+            "UPDATE ping_drafts SET text=?, state='handoff', created_ts=? WHERE id=?",
+            (text, ts_iso, pid),
+        )
 
     async def expire_ping_drafts(self, before_iso) -> list[dict]:
         """Ждущие пинги старше before_iso — в 'expired'. Забытый черновик раньше навсегда

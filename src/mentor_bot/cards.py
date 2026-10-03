@@ -8,6 +8,8 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 # кнопка-итог: нажатие ничего не делает, только напоминает, что карточка закрыта
 NOOP = "noop"
+# бот упал посреди отправки: ушло сообщение или нет, знает только чат
+UNCERTAIN_LABEL = "⚠️ Бот упал при отправке — проверь чат"
 
 
 def card_id(msg):
