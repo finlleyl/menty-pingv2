@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS questions(
   emb BLOB,
   kind TEXT NOT NULL DEFAULT 'question',
   emb_model TEXT,
-  msg_ids TEXT              -- JSON: message_id сообщений ученика, из которых собран вопрос
+  msg_ids TEXT,             -- JSON: message_id сообщений ученика, из которых собран вопрос
+  card_msg_id INTEGER       -- карточка в личке ментора: после действия редактируем её
 );
 CREATE INDEX IF NOT EXISTS idx_questions_user_state ON questions(username, state);
 -- style_samples отсекает черновики, ушедшие как есть, сравнением текста — без индекса это скан
@@ -54,7 +55,9 @@ CREATE TABLE IF NOT EXISTS proposals(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   username TEXT NOT NULL,
   new_status TEXT NOT NULL,
-  from_status TEXT
+  from_status TEXT,
+  card_msg_id INTEGER,
+  created_ts TEXT
 );
 CREATE TABLE IF NOT EXISTS profiles(
   username TEXT PRIMARY KEY,
@@ -105,7 +108,8 @@ CREATE TABLE IF NOT EXISTS ping_drafts(
   username TEXT NOT NULL,
   text TEXT NOT NULL,
   created_ts TEXT NOT NULL,
-  state TEXT NOT NULL DEFAULT 'open'
+  state TEXT NOT NULL DEFAULT 'open',
+  card_msg_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_ping_drafts_user_state ON ping_drafts(username, state);
 CREATE TABLE IF NOT EXISTS llm_usage(

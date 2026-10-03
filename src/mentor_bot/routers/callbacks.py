@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from aiogram import F, Router
 from aiogram.types import CallbackQuery
 
+from mentor_bot.cards import NOOP, hhmm
 from mentor_bot.sheets import RowNotFound, StatusConflict
 from mentor_bot.store.repo import SRC_BOT, SRC_BOT_EDIT
 from mentor_bot.style import todo_marks
@@ -22,14 +23,32 @@ async def _log_sent(repo, username: str, text: str, source: str):
                            source=source)
 
 
+# итог на карточке, если её кнопку нажали, когда запись уже закрыта (в том числе карточки,
+# отправленные до живых карточек): старые кнопки убираем, чтобы не путали
+_DONE = {
+    "sent": "✅ Отправлено", "dry": "🧪 Dry-run", "answered": "💬 Ответил в чате",
+    "ignored": "🙈 Игнор", "stale": "⏭ Неактуален", "skipped": "⏭ Пропущен",
+    "expired": "⌛ Истёк", "sending": "⏳ Отправляется",
+}
+
+
+def _tz(service) -> str:
+    return service.settings.tz_name
+
+
 async def start_edit(repo, kind: str, ident: int):
     await repo.set_setting(EDIT_KEY, f"{kind}:{ident}:{datetime.now(timezone.utc).isoformat()}")
 
 
-async def handle_q_callback(data: str, repo, sender, service) -> str:
+async def handle_q_callback(data: str, repo, sender, service, card=None) -> str:
+    """card — message_id нажатой карточки: запасной вариант для записей без card_msg_id."""
     _, action, qid = data.split(":")
     q = await repo.get_question(int(qid))
-    if not q or q["state"] != "open":
+    if not q:
+        return "Уже обработано"
+    card = q.get("card_msg_id") or card
+    if q["state"] != "open":
+        await sender.close_card(card, _DONE.get(q["state"], "✔️ Обработано"), q["username"])
         return "Уже обработано"
     if action == "edit":
         await start_edit(repo, "q", q["id"])
@@ -57,10 +76,13 @@ async def handle_q_callback(data: str, repo, sender, service) -> str:
             await repo.set_question_final(q["id"], q["draft"])
             if result == "sent":
                 await _log_sent(repo, q["username"], q["draft"], SRC_BOT)
+            label = f"✅ Отправлено {hhmm(_tz(service))}" if result == "sent" else "🧪 Dry-run: ушло тебе"
+            await sender.close_card(card, label, q["username"])
             return "Отправлено" if result == "sent" else "Dry-run: ушло тебе"
         await repo.set_question_state(q["id"], "open")
         return f"Не отправлено: {result}"
     await repo.set_question_state(q["id"], "ignored")
+    await sender.close_card(card, "🙈 Игнор", q["username"])
     return "Ок, игнорирую"
 
 
@@ -95,6 +117,11 @@ async def handle_edit_text(text: str, repo, sender, service) -> str | None:
         await repo.set_question_final(q["id"], text)
         if result == "sent":
             await _log_sent(repo, q["username"], text, SRC_BOT_EDIT)
+        await sender.close_card(
+            q.get("card_msg_id"),
+            f"✏️ Ушла твоя правка {hhmm(_tz(service))}" if result == "sent" else "🧪 Dry-run: ушло тебе",
+            q["username"],
+        )
         await repo.set_setting(EDIT_KEY, "")
         return f"Отправил @{q['username']} твой вариант" if result == "sent" else "Dry-run: ушло тебе"
     if kind == "p":
@@ -108,17 +135,22 @@ async def handle_edit_text(text: str, repo, sender, service) -> str | None:
     return None
 
 
-async def handle_st_callback(data: str, repo, sender, service) -> str:
+async def handle_st_callback(data: str, repo, sender, service, card=None) -> str:
     _, action, pid = data.split(":")
     p = await repo.get_proposal(int(pid))
     if not p:
+        await sender.close_card(card, "✔️ Обработано")
         return "Уже обработано"
+    card = p.get("card_msg_id") or card
+    user = p["username"]
     if action == "no":
         await repo.delete_proposal(p["id"])
+        await sender.close_card(card, "❌ Статус не меняем", user)
         return "Ок, статус не трогаю"
     m = service.by_username.get(p["username"])
     if m is None:
         await repo.delete_proposal(p["id"])
+        await sender.close_card(card, "⏭ Нет в таблице", user)
         return "Менти не найден в таблице"
     try:
         # сверка с таблицей: кнопка могла пролежать неделю, а статус с тех пор сменился
@@ -126,9 +158,11 @@ async def handle_st_callback(data: str, repo, sender, service) -> str:
     except StatusConflict as e:
         await repo.delete_proposal(p["id"])
         m.status = e.current or None
+        await sender.close_card(card, f"⏭ Уже «{e.current or '—'}»", user)
         return f"Статус уже «{e.current or '—'}» — предложение устарело, не трогаю"
     except RowNotFound:
         await repo.delete_proposal(p["id"])
+        await sender.close_card(card, "⏭ Нет в таблице", user)
         return f"@{p['username']} больше нет в таблице"
     except Exception:
         log.exception("set_status failed for @%s", p["username"])
@@ -137,15 +171,18 @@ async def handle_st_callback(data: str, repo, sender, service) -> str:
     await repo.record_status(p["username"], p["new_status"],
                              datetime.now(timezone.utc).isoformat(), "bot")
     await repo.delete_proposal(p["id"])
+    await sender.close_card(card, f"✅ «{p['new_status']}»", user)
     return f"Статус @{p['username']} → «{p['new_status']}»"
 
 
-async def handle_add_callback(data: str, repo, sender, service) -> str:
+async def handle_add_callback(data: str, repo, sender, service, card=None) -> str:
     _, idx, username = data.split(":")
     if idx == "skip":
         await repo.set_setting(f"ignore_chat:{username}", "1")
+        await sender.close_card(card, "🚫 Не менти")
         return "Ок, не менти"
     if username in service.by_username:
+        await sender.close_card(card, "✔️ Уже в таблице", username)
         return "Уже в таблице"
     titles = service.settings.active_sheet_titles
     if not idx.isdigit() or int(idx) >= len(titles):
@@ -153,17 +190,23 @@ async def handle_add_callback(data: str, repo, sender, service) -> str:
     title = titles[int(idx)]
     await service.sheets.append_mentee(title, f"@{username}")
     await service.sync_mentees()
+    await sender.close_card(card, f"➕ В «{title}»", username)
     return f"Добавил @{username} в «{title}»"
 
 
-async def handle_p_callback(data: str, repo, sender, service) -> str:
+async def handle_p_callback(data: str, repo, sender, service, card=None) -> str:
     from mentor_bot.jobs import send_ping_draft
     _, action, pid = data.split(":")
     d = await repo.get_ping_draft(int(pid))
-    if not d or d["state"] != "open":
+    if not d:
+        return "Уже обработано"
+    card = d.get("card_msg_id") or card
+    if d["state"] != "open":
+        await sender.close_card(card, _DONE.get(d["state"], "✔️ Обработано"), d["username"])
         return "Уже обработано"
     if action == "skip":
         await repo.set_ping_draft_state(d["id"], "skipped")
+        await sender.close_card(card, "⏭ Пропущен", d["username"])
         return "Ок, этот пинг пропускаю"
     if action == "edit":
         await start_edit(repo, "p", d["id"])
@@ -171,26 +214,34 @@ async def handle_p_callback(data: str, repo, sender, service) -> str:
             f"✏️ Пришли одним сообщением пинг для @{d['username']} — отправлю его. /cancel — передумал."
         )
         return "Жду текст"
-    return (await send_ping_draft(d["id"], service, repo, sender, service.settings)).message
+    return (await send_ping_draft(d["id"], service, repo, sender, service.settings,
+                                  card=card)).message
 
 
 def make_router(service, repo, sender) -> Router:
     router = Router()
 
+    def card(cb: CallbackQuery):
+        return cb.message.message_id if cb.message else None
+
     @router.callback_query(F.data.startswith("q:"))
     async def on_q(cb: CallbackQuery):
-        await cb.answer(await handle_q_callback(cb.data, repo, sender, service))
+        await cb.answer(await handle_q_callback(cb.data, repo, sender, service, card(cb)))
 
     @router.callback_query(F.data.startswith("st:"))
     async def on_st(cb: CallbackQuery):
-        await cb.answer(await handle_st_callback(cb.data, repo, sender, service))
+        await cb.answer(await handle_st_callback(cb.data, repo, sender, service, card(cb)))
 
     @router.callback_query(F.data.startswith("p:"))
     async def on_p(cb: CallbackQuery):
-        await cb.answer(await handle_p_callback(cb.data, repo, sender, service))
+        await cb.answer(await handle_p_callback(cb.data, repo, sender, service, card(cb)))
 
     @router.callback_query(F.data.startswith("add:"))
     async def on_add(cb: CallbackQuery):
-        await cb.answer(await handle_add_callback(cb.data, repo, sender, service))
+        await cb.answer(await handle_add_callback(cb.data, repo, sender, service, card(cb)))
+
+    @router.callback_query(F.data == NOOP)
+    async def on_noop(cb: CallbackQuery):
+        await cb.answer("Уже обработано")
 
     return router

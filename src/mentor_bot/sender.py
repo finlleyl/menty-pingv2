@@ -1,6 +1,11 @@
 import asyncio
+import logging
 
 from aiogram.types import BufferedInputFile
+
+from mentor_bot.cards import done_kb
+
+log = logging.getLogger(__name__)
 
 
 class Sender:
@@ -17,6 +22,19 @@ class Sender:
 
     async def notify_mentor(self, text: str, reply_markup=None):
         return await self.bot.send_message(self.mentor_user_id, text, reply_markup=reply_markup)
+
+    async def close_card(self, msg_id, label: str, username: str | None = None):
+        """Заменить кнопки карточки на итог («✅ Отправлено 14:32») и «Открыть чат»."""
+        if not msg_id:
+            return   # карточка из старой версии или не дошла — менять нечего
+        try:
+            await self.bot.edit_message_reply_markup(
+                chat_id=self.mentor_user_id, message_id=msg_id,
+                reply_markup=done_kb(label, username),
+            )
+        except Exception:
+            # карточку удалили или она уже с этим итогом — не повод ронять само действие
+            log.warning("card %s not updated", msg_id, exc_info=True)
 
     async def send_file_to_mentor(self, data: bytes, filename: str, caption: str = ""):
         await self.bot.send_document(

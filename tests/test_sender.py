@@ -51,3 +51,24 @@ async def test_no_bconn_fails_closed(tmp_path):
     s = Sender(bot, repo, mentor_user_id=42)
     assert await s.send_to_mentee("ivan", "x") == "no_bconn"
     assert bot.sent == []
+
+
+async def test_close_card_replaces_buttons_and_survives_telegram_errors(tmp_path):
+    bot, repo = await make(tmp_path)
+    edits = []
+
+    async def edit_message_reply_markup(chat_id, message_id, reply_markup):
+        edits.append((chat_id, message_id, reply_markup))
+        if message_id == 2:
+            raise RuntimeError("message to edit not found")
+
+    bot.edit_message_reply_markup = edit_message_reply_markup
+    s = Sender(bot, repo, mentor_user_id=999)
+    await s.close_card(1, "✅ Отправлено 14:32", "ivan")
+    await s.close_card(2, "🙈 Игнор")                 # карточку удалили — не падаем
+    await s.close_card(None, "🙈 Игнор")              # старая запись без карточки — no-op
+    chat_id, msg_id, markup = edits[0]
+    assert (chat_id, msg_id) == (999, 1)
+    assert markup.inline_keyboard[0][0].text == "✅ Отправлено 14:32"
+    assert markup.inline_keyboard[1][0].url == "https://t.me/ivan"
+    assert len(edits) == 2

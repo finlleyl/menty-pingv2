@@ -1,5 +1,6 @@
 import json
 from datetime import date
+from types import SimpleNamespace
 
 import pytest
 
@@ -83,9 +84,15 @@ class FakeLLM:
 class FakeSender:
     def __init__(self):
         self.mentor_msgs = []
+        self.closed_cards = []      # (message_id карточки, итог)
 
     async def notify_mentor(self, text, reply_markup=None):
         self.mentor_msgs.append((text, reply_markup))
+        return SimpleNamespace(message_id=1000 + len(self.mentor_msgs))
+
+    async def close_card(self, msg_id, label, username=None):
+        if msg_id:
+            self.closed_cards.append((msg_id, label))
 
     async def is_paused_all(self) -> bool:
         return False
@@ -747,3 +754,23 @@ async def test_reply_context_reaches_triage_draft_and_card(tmp_path):
     assert llm.triage_calls[0]["replies"] == replies
     assert llm.draft_calls[0]["replies"] == replies
     assert "↩️ Ментор: «Канал закрывает отправитель»" in sender.mentor_msgs[0][0]
+
+
+async def test_draft_card_is_remembered_and_closed_when_mentor_answers_in_chat(tmp_path):
+    repo, sender, kb, llm, svc = await make_triaged(tmp_path, kinds=["tech_question"])
+    await svc.handle_buffered("ivan", "кто закрывает канал?", TS)
+    [q] = await repo.open_questions()
+    assert q["card_msg_id"] == 1001
+    text, kb_markup = sender.mentor_msgs[0]
+    assert kb_markup.inline_keyboard[-1][0].url == "https://t.me/ivan"   # «Открыть чат»
+    await svc.on_outgoing("ivan", "закрывает отправитель, получатель дочитывает буфер до конца",
+                          "2026-08-19T11:00:00+00:00")
+    assert sender.closed_cards == [(1001, "💬 Ответил в чате")]
+
+
+async def test_status_proposal_card_is_remembered(tmp_path):
+    repo, sender, kb, llm, svc = await make_triaged(
+        tmp_path, kinds=["status_change"], needs_reply=False,
+        status=StatusUpdate(new_status="Собесы", confidence="high"))
+    await svc.handle_buffered("ivan", "завтра первый собес", TS)
+    assert (await repo.get_proposal(1))["card_msg_id"] == 1001

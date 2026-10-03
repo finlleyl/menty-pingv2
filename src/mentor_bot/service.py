@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from mentor_bot.cards import card_id, open_chat_row
 from mentor_bot.llm import looks_like_interview, looks_like_verdict
 from mentor_bot.pings import parse_iso_utc
 from mentor_bot.stages import STAGE_LABELS, call_permission, mentee_may_propose, parse_stage
@@ -28,10 +29,13 @@ ONGOING_HOURS = 12     # писали друг другу в эти часы —
 NOTIFY_LIMIT = 4000
 
 
-def _kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=t, callback_data=d) for t, d in row] for row in rows
-    ])
+def _kb(rows: list[list[tuple[str, str]]], chat: str | None = None) -> InlineKeyboardMarkup:
+    """chat — ник ученика: под кнопками действий строка «Открыть чат»."""
+    keyboard = [[InlineKeyboardButton(text=t, callback_data=d) for t, d in row] for row in rows]
+    if chat:
+        keyboard.append(open_chat_row(chat))
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
 
 
 def _prior_dialog(recent: list[dict], text: str) -> list[dict]:
@@ -122,11 +126,17 @@ class Service:
         if (m.status or "").strip() == new_status.strip():
             return  # статус уже такой — спрашивать нечего
         pid = await self.repo.add_proposal(username, new_status, m.status or "")
-        await self.sender.notify_mentor(
+        msg = await self.sender.notify_mentor(
             f"📋 {prefix}: {text[:200]}\n"
             f"Сменить статус «{m.status or '—'}» → «{new_status}»?{hint}",
             reply_markup=_kb([[("Да", f"st:yes:{pid}"), ("Нет", f"st:no:{pid}")]]),
         )
+        await self.repo.set_card("proposals", pid, card_id(msg))
+
+    async def close_cards(self, rows, label: str, username: str | None = None):
+        """Карточки закрытых без кнопок вопросов и пингов — итогом вместо кнопок."""
+        for r in rows:
+            await self.sender.close_card(r.get("card_msg_id"), label, username)
 
     async def _touch_sheet_date(self, username: str, ts_iso: str):
         m = self.by_username.get(username)
@@ -166,10 +176,11 @@ class Service:
         # ответ ментора своими словами — лучший пример для будущих черновиков
         await self.repo.record_manual_answer(username, text, datetime.fromisoformat(ts_iso),
                                              question_id=qid)
-        await self.repo.close_open_questions(username, question_id=qid)
+        closed = await self.repo.close_open_questions(username, question_id=qid)
         # ментор ответил сам — накопленное обрабатывать не нужно, ждущий пинг тоже
         await self.repo.drop_pending(username)
-        await self.repo.close_ping_drafts(username)
+        closed += await self.repo.close_ping_drafts(username)
+        await self.close_cards(closed, "💬 Ответил в чате", username)
         try:
             await self._touch_sheet_date(username, ts_iso)
         except Exception:
@@ -203,7 +214,8 @@ class Service:
             log.exception("sheet date update failed")
             await self.sender.notify_mentor(f"⚠️ Не смог обновить дату в таблице для @{username}")
         # ученик вышел на связь — пинг, ждущий одобрения, больше не нужен
-        await self.repo.close_ping_drafts(username)
+        await self.close_cards(await self.repo.close_ping_drafts(username),
+                               "⏭ Ученик написал сам", username)
         # LLM здесь НЕ дёргаем: копим в буфер, обработает drain_pending
         await self.repo.buffer_incoming(username, text, ts_iso, tg_id=tg_id, reply_to=reply_to)
 
@@ -331,16 +343,17 @@ class Service:
         room = NOTIFY_LIMIT - len(head) - len(tail) - 1
         shown = text if len(text) <= room else text[:max(200, room - 1)] + "…"
         try:
-            await self.sender.notify_mentor(
+            msg = await self.sender.notify_mentor(
                 f"{head}\n{shown}{tail}",
                 reply_markup=_kb([[("Отправить", f"q:send:{qid}"), ("✏️ Править", f"q:edit:{qid}"),
-                                   ("Игнор", f"q:ign:{qid}")]]),
+                                   ("Игнор", f"q:ign:{qid}")]], chat=username),
             )
         except Exception:
             # ментор черновик не увидел — открытым не держим, иначе remind_cycle напомнит
             # о сообщении, кнопок к которому у него нет
             await self.repo.set_question_state(qid, "ignored")
             raise
+        await self.repo.set_card("questions", qid, card_id(msg))
 
     async def _collect_interview(self, username: str, text: str, ts_iso: str):
         report = await self.llm.extract_interview(text)

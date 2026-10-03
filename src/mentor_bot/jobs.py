@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from mentor_bot.cards import card_id, hhmm, open_chat_row
 from mentor_bot.llm import LLMUnavailable
 from mentor_bot.pings import (
     effective_last_contact,
@@ -117,10 +118,11 @@ async def ping_cycle(service, repo, sender, llm, settings, now_utc: datetime | N
             await repo.log_ping(username, now_utc.isoformat(), "review")
             warn = (f"\n\n⚠️ Модель дважды затронула запрещённое для стадии: {', '.join(hits)}"
                     if hits else "")
-            await sender.notify_mentor(
+            msg = await sender.notify_mentor(
                 f"📨 Пинг для @{username} ({STAGE_LABELS[stage]}):\n{text}{warn}",
-                reply_markup=ping_draft_kb(pid),
+                reply_markup=ping_draft_kb(pid, username),
             )
+            await repo.set_card("ping_drafts", pid, card_id(msg))
             continue
 
         await repo.log_ping(username, now_utc.isoformat(), "attempt")
@@ -139,12 +141,15 @@ async def ping_cycle(service, repo, sender, llm, settings, now_utc: datetime | N
 
 
 
-def ping_draft_kb(pid: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
+def ping_draft_kb(pid: int, username: str | None = None) -> InlineKeyboardMarkup:
+    rows = [[
         InlineKeyboardButton(text="Отправить", callback_data=f"p:send:{pid}"),
         InlineKeyboardButton(text="✏️ Править", callback_data=f"p:edit:{pid}"),
         InlineKeyboardButton(text="Пропустить", callback_data=f"p:skip:{pid}"),
-    ]])
+    ]]
+    if username:
+        rows.append(open_chat_row(username))
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def after_ping(result, username, m, text, service, repo, sender, settings, now_utc,
@@ -189,28 +194,35 @@ class DraftOutcome:
 
 
 async def send_ping_draft(pid, service, repo, sender, settings, text=None,
-                          now_utc: datetime | None = None) -> DraftOutcome:
-    """Отправка одобренного пинга: как есть (text=None) или в редакции ментора."""
+                          now_utc: datetime | None = None, card=None) -> DraftOutcome:
+    """Отправка одобренного пинга: как есть (text=None) или в редакции ментора.
+    card — message_id нажатой карточки, если в записи его нет (карточки старых версий)."""
     now_utc = now_utc or datetime.now(timezone.utc)
     d = await repo.get_ping_draft(pid)
     if not d or d["state"] != "open":
         return DraftOutcome("Уже обработано")
     username = d["username"]
+    card = d.get("card_msg_id") or card
+
+    async def close(state, label):
+        await repo.set_ping_draft_state(pid, state)
+        await sender.close_card(card, label, username)
+
     last_in = await repo.last_in_ts(username)
     if last_in and parse_iso_utc(last_in) > parse_iso_utc(d["created_ts"]):
         # пока пинг лежал, ученик написал сам — «ты куда пропал?» теперь неуместно
-        await repo.set_ping_draft_state(pid, "stale")
+        await close("stale", "⏭ Ученик написал сам")
         return DraftOutcome(f"@{username} уже написал сам — пинг неактуален, не отправляю")
     m = service.by_username.get(username)
     if m is None:
-        await repo.set_ping_draft_state(pid, "stale")
+        await close("stale", "⏭ Нет в таблице")
         return DraftOutcome(f"@{username} больше нет в таблице")
     # пока черновик лежал, могли поставить паузу или стоп-статус — перепроверяем
     rec = await repo.get_mentee(username) or {}
     paused = rec.get("paused_until") and parse_iso_utc(rec["paused_until"]) > now_utc
     if paused or is_stopped(m.status, settings.stop_status_list) \
             or rec.get("unanswered_pings", 0) >= settings.max_unanswered_pings:
-        await repo.set_ping_draft_state(pid, "stale")
+        await close("stale", "⏸ Сейчас пинговать нельзя")
         return DraftOutcome(f"@{username} сейчас пинговать нельзя (пауза, стоп-статус или игнор) — не отправляю")
     if not await repo.claim("ping_drafts", pid):
         return DraftOutcome("Уже обработано")   # второе быстрое нажатие
@@ -227,6 +239,9 @@ async def send_ping_draft(pid, service, repo, sender, settings, text=None,
         await repo.set_ping_draft_state(pid, "open")
         return DraftOutcome(f"Не отправлено: {result}", retry=True)
     await repo.set_ping_draft_state(pid, result)
+    label = ("🧪 Dry-run: ушло тебе" if result == "dry"
+             else f"{'✏️ Ушёл твой пинг' if edited else '✅ Пинг ушёл'} {hhmm(settings.tz_name, now_utc)}")
+    await sender.close_card(card, label, username)
     await after_ping(result, username, m, text, service, repo, sender, settings, now_utc,
                      source=SRC_BOT_EDIT if edited else SRC_BOT)
     return DraftOutcome(f"Пинг @{username} отправлен" if result == "sent" else "Dry-run: ушло тебе")

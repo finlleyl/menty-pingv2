@@ -118,7 +118,16 @@ async def _m4_message_ids(conn):
     )
 
 
-MIGRATIONS = (_m1_legacy_columns, _m2_pending_rows, _m3_embeddings, _m4_message_ids)
+async def _m5_cards(conn):
+    """message_id карточек в личке ментора: после действия карточку редактируем на месте."""
+    for table in ("questions", "ping_drafts", "proposals"):
+        await _add_column(conn, table, "card_msg_id", "INTEGER")
+    await _add_column(conn, "proposals", "created_ts", "TEXT")
+
+
+MIGRATIONS = (_m1_legacy_columns, _m2_pending_rows, _m3_embeddings, _m4_message_ids, _m5_cards)
+
+CARD_TABLES = ("questions", "ping_drafts", "proposals")
 
 
 class Repo:
@@ -439,23 +448,34 @@ class Repo:
     async def mark_reminded(self, qid):
         await self._exec("UPDATE questions SET reminded=1 WHERE id=?", (qid,))
 
-    async def close_open_questions(self, username, question_id=None):
-        """question_id — закрыть только этот вопрос (ментор ответил reply-ем на него)."""
-        if question_id is not None:
-            await self._exec(
-                "UPDATE questions SET state='answered' WHERE id=? AND state='open'", (question_id,)
+    async def close_open_questions(self, username, question_id=None) -> list[dict]:
+        """question_id — закрыть только этот вопрос (ментор ответил reply-ем на него).
+        Возвращает закрытые [{id, card_msg_id}] — их карточки надо пометить."""
+        where, args = (("id=?", (question_id,)) if question_id is not None
+                       else ("username=?", (username,)))
+        return await self._close("questions", "answered", where, args)
+
+    async def _close(self, table, state, where, args) -> list[dict]:
+        async with self._tx() as c:
+            cur = await c.execute(
+                f"SELECT id, card_msg_id FROM {table} WHERE {where} AND state='open'", args
             )
-            return
-        await self._exec(
-            "UPDATE questions SET state='answered' WHERE username=? AND state='open'", (username,)
-        )
+            rows = [dict(r) for r in await cur.fetchall()]
+            await c.execute(f"UPDATE {table} SET state=? WHERE {where} AND state='open'",
+                            (state,) + args)
+        return rows
+
+    async def set_card(self, table, rid, msg_id):
+        assert table in CARD_TABLES
+        await self._exec(f"UPDATE {table} SET card_msg_id=? WHERE id=?", (msg_id, rid))
 
     # proposals
     async def add_proposal(self, username, new_status, from_status=None) -> int:
         """from_status — статус на момент предложения; None — не сверять (старые записи)."""
+        from datetime import datetime, timezone
         cur = await self._exec(
-            "INSERT INTO proposals(username, new_status, from_status) VALUES (?,?,?)",
-            (username, new_status, from_status),
+            "INSERT INTO proposals(username, new_status, from_status, created_ts) VALUES (?,?,?,?)",
+            (username, new_status, from_status, datetime.now(timezone.utc).isoformat()),
         )
         return cur.lastrowid
 
@@ -631,10 +651,9 @@ class Repo:
     async def set_ping_draft_state(self, pid, state):
         await self._exec("UPDATE ping_drafts SET state=? WHERE id=?", (state, pid))
 
-    async def close_ping_drafts(self, username, state="stale"):
-        await self._exec(
-            "UPDATE ping_drafts SET state=? WHERE username=? AND state='open'", (state, username)
-        )
+    async def close_ping_drafts(self, username, state="stale") -> list[dict]:
+        """Закрыть ждущие пинги ученика; возвращает закрытые [{id, card_msg_id}]."""
+        return await self._close("ping_drafts", state, "username=?", (username,))
 
     # interview_notes — вопросы с собесов, которые пересказал ученик
     async def add_interview_notes(self, username, source_ts, items, embs, emb_model=None):

@@ -230,3 +230,37 @@ async def test_bot_sends_are_logged_with_their_source(tmp_path):
                     {"text": "мой вариант ответа", "source": "bot_edit"}]
     assert (await repo.get_question(q2))["state"] == "sent"     # первая отправка его не закрыла
     assert await repo.last_out_ts("ivan") is None               # и ручным ответом не считается
+
+
+async def test_cards_show_the_outcome_instead_of_buttons(tmp_path):
+    repo, sheets, sender, svc = await make(tmp_path)
+    q1 = await repo.add_question("ivan", "вопрос", "черновик", "2026-08-19T10:00:00+00:00")
+    q2 = await repo.add_question("ivan", "ещё", "черновик 2", "2026-08-19T10:01:00+00:00")
+    await repo.set_card("questions", q1, 501)
+    await repo.set_card("questions", q2, 502)
+    await handle_q_callback(f"q:send:{q1}", repo, sender, svc)
+    await handle_q_callback(f"q:ign:{q2}", repo, sender, svc)
+    assert sender.closed_cards[0][0] == 501 and sender.closed_cards[0][1].startswith("✅ Отправлено")
+    assert sender.closed_cards[1] == (502, "🙈 Игнор")
+    # старая кнопка на уже закрытой карточке убирается, а не отвечает «Уже обработано» вечно
+    assert await handle_q_callback(f"q:send:{q2}", repo, sender, svc) == "Уже обработано"
+    assert sender.closed_cards[2] == (502, "🙈 Игнор")
+
+
+async def test_card_of_old_version_falls_back_to_the_pressed_message(tmp_path):
+    repo, sheets, sender, svc = await make(tmp_path)
+    qid = await repo.add_question("ivan", "вопрос", "черновик", "2026-08-19T10:00:00+00:00")
+    await handle_q_callback(f"q:ign:{qid}", repo, sender, svc, card=777)
+    assert sender.closed_cards == [(777, "🙈 Игнор")]
+
+
+async def test_status_and_add_cards_are_closed(tmp_path):
+    repo, sheets, sender, svc = await make(tmp_path)
+    pid = await repo.add_proposal("ivan", "Собесы", "3 спринт")
+    await repo.set_card("proposals", pid, 601)
+    await handle_st_callback(f"st:yes:{pid}", repo, sender, svc)
+    pid2 = await repo.add_proposal("ivan", "оффер", "Собесы")
+    await handle_st_callback(f"st:no:{pid2}", repo, sender, svc, card=602)
+    await handle_add_callback("add:skip:mama", repo, sender, svc, card=603)
+    assert sender.closed_cards == [(601, "✅ «Собесы»"), (602, "❌ Статус не меняем"),
+                                   (603, "🚫 Не менти")]
