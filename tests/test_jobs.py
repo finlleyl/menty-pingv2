@@ -580,3 +580,24 @@ async def test_ignored_pings_escalate_with_buttons(tmp_path):
     assert out.startswith("Ок, @ivan снова пингую после")
     await handle_esc_callback("esc:reset:ivan", repo, sender, svc, card=77)
     assert (await repo.get_mentee("ivan"))["paused_until"] is None
+
+
+async def test_ping_quoting_mentor_notes_is_rewritten_then_held_for_review(tmp_path):
+    notes_mentee = sm()
+    notes_mentee.notes = "ленивый, мотивировать деньгами иначе забивает"
+    repo, sheets, sender, llm, svc = await make(tmp_path, mentees=[notes_mentee])
+    await _live(repo)
+    texts = iter(["Помни: мотивировать деньгами иначе забивает. Как спринт?",
+                  "Ну что, мотивировать деньгами иначе забивает, да?"])
+    avoid_seen = []
+
+    async def leaky(display, status, recent, profile, notes=None, avoid=None, samples=None):
+        avoid_seen.append(avoid)
+        return next(texts)
+
+    llm.gen_ping = leaky
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC)
+    assert avoid_seen[1][0].startswith("цитата из заметок")      # переписывали
+    assert sender.mentee_msgs == []                                # ученику не ушло
+    assert "⚠️ Похоже на личное" in sender.mentor_msgs[-1][0]
+    assert (await repo.open_ping_draft("ivan"))["state"] == "open"

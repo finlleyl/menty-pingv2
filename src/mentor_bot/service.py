@@ -13,7 +13,7 @@ from mentor_bot.pings import parse_iso_utc
 from mentor_bot.sheets import SheetSchemaChanged, report_problems
 from mentor_bot.stages import STAGE_LABELS, call_permission, mentee_may_propose, parse_stage
 from mentor_bot.store.repo import KIND_HUMAN, KIND_QUESTION
-from mentor_bot.style import TECH_KINDS, draft_problems, normalize_dashes, todo_marks
+from mentor_bot.style import TECH_KINDS, draft_problems, leaks_private, normalize_dashes, todo_marks
 
 log = logging.getLogger(__name__)
 
@@ -131,6 +131,15 @@ class Service:
             # ручные правки статуса в таблице тоже попадают в историю и сдвигают status_since
             await self.repo.record_status(m.username, m.status, now_iso, "sheet")
         return self.by_username
+
+    def others(self, username: str) -> list[tuple[str, str]]:
+        """Остальные ученики: (ник, имя без ника) — для проверки на утечку чужого."""
+        out = []
+        for other, m in self.by_username.items():
+            if other != username:
+                name = re.sub(r"@\w+", "", m.display or "").strip()
+                out.append((other, name))
+        return out
 
     async def alert_once(self, key: str, text: str):
         """Предупреждение ментору без повторов: то же самое не шлём, пока проблема не сменится
@@ -360,12 +369,20 @@ class Service:
             similar=similar, examples=await self.repo.edit_examples(5, kind=group),
             samples=samples, call=call, urgent=tri.urgent, ongoing=ongoing, replies=replies,
         )
+        notes = m.notes if m else None
+        others = self.others(username)
+
+        def check(reply):
+            # черновик ты читаешь перед отправкой, но цитату заметок лучше не видеть вовсе
+            return (draft_problems(reply, kinds, call, ongoing, samples)
+                    + leaks_private(reply, notes, ctx["profile"], others))
+
         reply = await self.llm.draft_reply(text, kinds, **ctx)
-        problems = draft_problems(reply, kinds, call, ongoing, samples)
+        problems = check(reply)
         if problems:
             log.warning("draft for %s failed lint %s, regenerating", username, problems)
             reply = await self.llm.draft_reply(text, kinds, **ctx, avoid=problems)
-            problems = draft_problems(reply, kinds, call, ongoing, samples)
+            problems = check(reply)
         return Draft(normalize_dashes(reply, samples), problems, emb, group, len(similar))
 
     async def _stage_line(self, username: str, status, ts_iso: str) -> str:

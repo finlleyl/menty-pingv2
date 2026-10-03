@@ -21,7 +21,7 @@ from mentor_bot.pings import (
 )
 from mentor_bot.stages import STAGE_LABELS, forbidden_hits, parse_stage
 from mentor_bot.store.repo import KIND_HUMAN, SRC_BOT, SRC_BOT_EDIT
-from mentor_bot.style import ai_tells, normalize_dashes
+from mentor_bot.style import ai_tells, leaks_private, normalize_dashes
 
 log = logging.getLogger(__name__)
 
@@ -102,15 +102,18 @@ async def ping_cycle(service, repo, sender, llm, settings, now_utc: datetime | N
             profile = await repo.get_profile(username)
             if samples is None:
                 samples = await repo.style_samples()   # одни на весь цикл: стиль ментора общий
+            others = service.others(username)
             text = await llm.gen_ping(m.display, m.status, recent, profile, m.notes,
                                       samples=samples)
             hits = forbidden_hits(text, stage)
+            leaks = leaks_private(text, m.notes, profile, others)
             tells = ai_tells(text, samples=samples)
-            if hits or tells:
-                log.warning("ping for %s touched %s, regenerating", username, hits + tells)
+            if hits or leaks or tells:
+                log.warning("ping for %s touched %s, regenerating", username, hits + leaks + tells)
                 text = await llm.gen_ping(m.display, m.status, recent, profile, m.notes,
-                                          avoid=hits + tells, samples=samples)
+                                          avoid=hits + leaks + tells, samples=samples)
                 hits = forbidden_hits(text, stage)
+                leaks = leaks_private(text, m.notes, profile, others)
             # штамп, переживший переписку, — повод поправить тон, но не держать пинг:
             # на одобрение уходят только запретные темы и созвоны
             text = normalize_dashes(text, samples)
@@ -119,12 +122,15 @@ async def ping_cycle(service, repo, sender, llm, settings, now_utc: datetime | N
             errors += 1
             continue
 
-        if review or hits:
+        if review or hits or leaks:
             # не отправляем сами: либо так настроено, либо модель дважды нарушила запрет
+            # или процитировала твои заметки — с аккаунта ментора такое уходить не должно
             pid = await repo.add_ping_draft(username, text, now_utc.isoformat())
             await repo.log_ping(username, now_utc.isoformat(), "review")
             warn = (f"\n\n⚠️ Модель дважды затронула запрещённое для стадии: {', '.join(hits)}"
                     if hits else "")
+            if leaks:
+                warn += f"\n\n⚠️ Похоже на личное: {'; '.join(leaks)}"
             msg = await sender.notify_mentor(
                 f"📨 Пинг для @{username} ({STAGE_LABELS[stage]}):\n{text}{warn}",
                 reply_markup=ping_draft_kb(pid, username),

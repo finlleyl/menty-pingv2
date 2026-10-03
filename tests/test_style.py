@@ -177,3 +177,26 @@ def test_todo_marks_found_and_invisible_to_lint():
                                 "[просит созвон - реши сам]"]
     assert todo_marks("Скинь код, гляну [вот сюда]") == []
     assert draft_problems(text, ["tech_question"], call=None) == []
+
+
+def test_leaks_private_catches_quotes_from_notes_and_dossier():
+    from mentor_bot.style import leaks_private
+    notes = "ленивый, мотивировать деньгами иначе забивает на учёбу"
+    profile = "Работает сменами на складе, по выходным не трогать"
+    assert leaks_private("Слушай, мотивировать деньгами иначе забивает — так что давай", notes) == [
+        "цитата из заметок: «мотивировать деньгами иначе забивает»"]
+    assert leaks_private("Знаю, ты работает сменами на складе, но спринт сам себя не сдаст",
+                         profile=profile) == ["цитата из досье: «работает сменами на складе»"]
+    # общие слова и короткие совпадения — не цитата
+    assert leaks_private("Как там спринт, разобрался с каналами?", notes, profile) == []
+    assert leaks_private("и в том числе", "и в том числе") == []
+
+
+def test_leaks_private_catches_other_mentees():
+    from mentor_bot.style import leaks_private
+    others = [("petr_dev", "Пётр Иванов"), ("sasha", "Саша")]
+    assert leaks_private("Вон @petr_dev уже сдал третий", others=others) == ["чужой ученик: @petr_dev"]
+    assert leaks_private("Пётр Иванов тоже застревал на каналах", others=others) == [
+        "чужой ученик: Пётр Иванов"]
+    assert leaks_private("Саша, как дела?", others=others) == []   # одно имя — слишком частое
+    assert leaks_private("почта ivan@petr_dev.ru", others=others) == []

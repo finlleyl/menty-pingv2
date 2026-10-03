@@ -166,3 +166,46 @@ def draft_problems(text: str, kinds, call: str | None, ongoing: bool = False,
             # регулярка от предложения не отличит, а решать про созвон вне регламента ментору
             problems.append(f"упоминает созвон ({', '.join('«' + h + '»' for h in hits[:3])})")
     return problems + ai_tells(text, kinds, ongoing, samples)
+
+
+# Утечка личного: модель видит «Заметочки» и досье («ленивый, мотивировать деньгами») и чужие
+# ответы, а текст уходит с аккаунта ментора. Цитату ловим по LEAK_RUN словам подряд: короче —
+# совпадают обычные обороты («как там спринт»), длиннее — пропускаем почти дословные куски
+LEAK_RUN = 4
+_TOKEN_RE = re.compile(r"[\wё]+", re.IGNORECASE)
+
+
+def _tokens(text: str) -> list[str]:
+    return [t.replace("ё", "е") for t in _TOKEN_RE.findall((text or "").lower())]
+
+
+def _runs(tokens: list[str]) -> dict[tuple, int]:
+    """Цепочки из LEAK_RUN слов, в которых хотя бы два слова не служебные (4+ буквы):
+    «и в том числе» — не цитата, «мотивировать деньгами, иначе забивает» — цитата."""
+    out = {}
+    for i in range(len(tokens) - LEAK_RUN + 1):
+        run = tuple(tokens[i:i + LEAK_RUN])
+        if sum(len(t) >= 4 for t in run) >= 2:
+            out.setdefault(run, i)
+    return out
+
+
+def leaks_private(text: str, notes: str = "", profile: str = "", others=()) -> list[str]:
+    """Что личного просочилось в текст для ученика. others — другие ученики: (ник, имя).
+    Пусто — чисто."""
+    out = []
+    mine = _runs(_tokens(text))
+    for label, source in (("заметок", notes), ("досье", profile)):
+        common = mine.keys() & _runs(_tokens(source)).keys()
+        if common:
+            first = min(common, key=mine.get)
+            out.append(f"цитата из {label}: «{' '.join(first)}»")
+    low = " ".join(_tokens(text))
+    raw = (text or "").lower()
+    for username, name in others:
+        # чужой ник — однозначно утечка; имя — только имя с фамилией: одно «Саша» слишком частое
+        if username and len(username) >= 4 and re.search(rf"(?<![\w@])@?{re.escape(username)}\b", raw):
+            out.append(f"чужой ученик: @{username}")
+        elif name and len(name.split()) >= 2 and " ".join(_tokens(name)) in low:
+            out.append(f"чужой ученик: {name}")
+    return out

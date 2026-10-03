@@ -820,3 +820,13 @@ async def test_broken_header_stops_date_writes_with_one_alert(tmp_path):
     alerts = [t for t, _ in sender.mentor_msgs if "Лист «A»" in t]
     assert alerts == ["⚠️ Лист «A»: неясно, где дата контакта: «Дата» или «Дата» — даты не пишу"]
     assert (await repo.get_pending("ivan"))["texts"] == ["привет", "ау"]   # сообщения не потеряны
+
+
+async def test_draft_mentioning_another_mentee_is_flagged(tmp_path):
+    repo, sender, kb, llm, svc = await make_triaged(
+        tmp_path, kinds=["tech_question"],
+        drafts=["Вон @petr_dev уже сдал, и ты сдашь", "Вон @petr_dev уже сдал"])
+    svc.by_username["petr_dev"] = sm("petr_dev")
+    await svc.handle_buffered("ivan", "застрял на каналах", TS)
+    assert llm.draft_calls[1]["avoid"] == ["чужой ученик: @petr_dev"]
+    assert "⚠️ проверь: чужой ученик: @petr_dev" in sender.mentor_msgs[0][0]
