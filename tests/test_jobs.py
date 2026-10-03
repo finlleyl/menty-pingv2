@@ -601,3 +601,15 @@ async def test_ping_quoting_mentor_notes_is_rewritten_then_held_for_review(tmp_p
     assert sender.mentee_msgs == []                                # ученику не ушло
     assert "⚠️ Похоже на личное" in sender.mentor_msgs[-1][0]
     assert (await repo.open_ping_draft("ivan"))["state"] == "open"
+
+
+async def test_unreadable_sheet_alerts_once_not_every_hour(tmp_path):
+    repo, sheets, sender, llm, svc = await make(tmp_path)
+
+    async def down():
+        raise RuntimeError("503")
+
+    sheets.load_mentees = down
+    for hour in range(3):
+        await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC + timedelta(hours=hour))
+    assert len([t for t, _ in sender.mentor_msgs if "Не могу прочитать таблицу" in t]) == 1

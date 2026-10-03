@@ -276,6 +276,9 @@ def looks_like_interview(text: str) -> bool:
     return bool(_INTERVIEW_RE.search(text or ""))
 
 
+LLM_TIMEOUT = 90.0   # секунд на запрос к модели; длиннее — считаем провайдера недоступным
+
+
 class LLMUnavailable(Exception):
     """Провайдер не отвечает: сеть, ключ, кредиты, лимиты, 5xx. Сообщение не виновато — повторить позже."""
 
@@ -328,7 +331,9 @@ class LLM:
         # usage_sink(ts_iso, task, model, prompt_tokens, completion_tokens, cost) — учёт расходов
         self._usage_sink = usage_sink
         if client is None:
-            client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url or None)
+            # без таймаута SDK ждёт ответа до 10 минут — всё это время джоба разбора стоит
+            client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url or None,
+                                        timeout=LLM_TIMEOUT, max_retries=2)
         self._c = client
         self.smart = model_smart
         self.fast = model_fast

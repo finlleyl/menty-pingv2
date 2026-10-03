@@ -122,4 +122,13 @@ CREATE TABLE IF NOT EXISTS llm_usage(
   cost REAL
 );
 CREATE INDEX IF NOT EXISTS idx_llm_usage_ts ON llm_usage(ts);
+-- журнал фоновых задач для /health: когда последний раз запускалась, прошла, упала
+CREATE TABLE IF NOT EXISTS job_runs(
+  job TEXT PRIMARY KEY,
+  last_start TEXT,
+  last_ok TEXT,
+  last_error TEXT,
+  last_error_ts TEXT,
+  missed INTEGER NOT NULL DEFAULT 0
+);
 """

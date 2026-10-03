@@ -612,6 +612,59 @@ class Repo:
             w["replies"] = list(dict.fromkeys(r["reply_to"] for r in rows if r["reply_to"]))
         return windows
 
+    # job_runs — журнал фоновых задач для /health
+    async def job_started(self, job, ts_iso):
+        await self._exec(
+            "INSERT INTO job_runs(job, last_start) VALUES (?,?) "
+            "ON CONFLICT(job) DO UPDATE SET last_start=excluded.last_start",
+            (job, ts_iso),
+        )
+
+    async def job_finished(self, job, ts_iso, error=None):
+        if error is None:
+            await self._exec("UPDATE job_runs SET last_ok=? WHERE job=?", (ts_iso, job))
+        else:
+            await self._exec("UPDATE job_runs SET last_error=?, last_error_ts=? WHERE job=?",
+                             (error, ts_iso, job))
+
+    async def job_missed(self, job):
+        await self._exec(
+            "INSERT INTO job_runs(job, missed) VALUES (?, 1) "
+            "ON CONFLICT(job) DO UPDATE SET missed=missed+1",
+            (job,),
+        )
+
+    async def job_runs(self):
+        return await self._all("SELECT * FROM job_runs ORDER BY job")
+
+    async def queue_stats(self, old_iso) -> dict:
+        """Что ждёт обработки — для /health."""
+        pending = await self._one("SELECT COUNT(*) AS n, MIN(ts) AS oldest FROM pending_messages")
+        questions = await self._one(
+            "SELECT COUNT(*) AS n, SUM(created_ts < ?) AS old FROM questions WHERE state='open'",
+            (old_iso,),
+        )
+        pings = await self._one(
+            "SELECT COUNT(*) AS n FROM ping_drafts WHERE state IN ('open', 'handoff')"
+        )
+        chat = await self._one(f"SELECT MAX(ts) AS ts FROM messages WHERE source='{SRC_CHAT}'")
+        return {
+            "pending": pending["n"], "pending_oldest": pending["oldest"],
+            "open_questions": questions["n"], "old_questions": questions["old"] or 0,
+            "waiting_pings": pings["n"], "last_chat": chat["ts"],
+        }
+
+    async def release_stuck(self) -> int:
+        """После рестарта: «Отправить» нажали, а бот упал до итога — запись так и висела в
+        'sending', и кнопка отвечала «Уже обработано». На старте в полёте ничего нет —
+        возвращаем такие записи в 'open', кнопки снова работают."""
+        async with self._tx() as c:
+            n = 0
+            for table in ("questions", "ping_drafts"):
+                cur = await c.execute(f"UPDATE {table} SET state='open' WHERE state='sending'")
+                n += cur.rowcount
+        return n
+
     # llm_usage — учёт токенов и денег
     async def log_usage(self, ts_iso, task, model, prompt_tokens, completion_tokens, cost):
         await self._exec(

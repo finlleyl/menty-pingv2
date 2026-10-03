@@ -13,7 +13,7 @@ from mentor_bot.routers.callbacks import EDIT_KEY, handle_edit_text
 _bg_tasks: set = set()
 
 HELP = (
-    "/status — сводка\n/digest — недельная сводка по воронке\n/fails — на чём срезаются на собесах\n"
+    "/status — сводка\n/health — всё ли работает: подключение, LLM, задачи, очередь\n/digest — недельная сводка по воронке\n/fails — на чём срезаются на собесах\n"
     "/pause @user N — пауза пингов\n/pause_all, /resume_all — стоп-кран\n"
     "/dryrun on|off — тестовый режим\n/pingmode auto|review — пинги сами или через тебя\n"
     "/cost [дней] — расходы на LLM\n/backup — бэкап базы файлом\n"
@@ -133,6 +133,12 @@ def make_router(service, repo, sender, settings, reindex_fn, backup_fn=None) -> 
         except Exception:
             await message.answer("⚠️ Не смог перечитать таблицу — показываю по кэшу")
         await message.answer(await status_text(service, repo, settings, datetime.now(timezone.utc)))
+
+    @router.message(Command("health"))
+    async def cmd_health(message: Message):
+        from mentor_bot.health import health_text
+        await message.answer(await health_text(service, repo, settings, sender.bot,
+                                               datetime.now(timezone.utc)))
 
     @router.message(Command("pause"))
     async def cmd_pause(message: Message):

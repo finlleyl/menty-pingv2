@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 from aiogram.types import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup
 
 from mentor_bot.cards import card_id, hhmm, open_chat_row
+from mentor_bot.health import alert_once
 from mentor_bot.llm import LLMUnavailable
 from mentor_bot.pings import (
     effective_last_contact,
@@ -39,10 +40,13 @@ async def ping_cycle(service, repo, sender, llm, settings, now_utc: datetime | N
         return
     try:
         await service.sync_mentees()
-    except Exception:
+    except Exception as e:
         log.exception("sheet sync failed")
-        await sender.notify_mentor("⚠️ Не смог прочитать таблицу, цикл пингов пропущен")
+        # раз в час одно и то же — шум: одно предупреждение, пока таблица не прочитается
+        await alert_once(repo, sender, "sheet_sync",
+                         f"⚠️ Не могу прочитать таблицу ({type(e).__name__}) — пинги на паузе")
         return
+    await alert_once(repo, sender, "sheet_sync", "")
 
     for d in await repo.expire_ping_drafts((now_utc - PING_DRAFT_TTL).isoformat()):
         await sender.close_card(d["card_msg_id"], "⌛ Истёк", d["username"])
@@ -154,8 +158,8 @@ async def ping_cycle(service, repo, sender, llm, settings, now_utc: datetime | N
         if result == "sent":
             await asyncio.sleep(58)  # rate limit ≤1 пинг/мин
 
-    if errors:
-        await sender.notify_mentor(f"⚠️ Цикл пингов: {errors} ошибок, детали в логах")
+    await alert_once(repo, sender, "ping_errors",
+                     "⚠️ В цикле пингов ошибки — подробности в /health и логах" if errors else "")
 
 
 
@@ -386,9 +390,10 @@ async def dossier_cycle(service, repo, llm, sender, settings, now_utc: datetime 
     now_utc = now_utc or datetime.now(timezone.utc)
     try:
         await service.sync_mentees()
-    except Exception:
+    except Exception as e:
         log.exception("sheet sync failed")
-        await sender.notify_mentor("⚠️ Досье: не смог прочитать таблицу, цикл пропущен")
+        await alert_once(repo, sender, "sheet_sync",
+                         f"⚠️ Не могу прочитать таблицу ({type(e).__name__}) — досье не обновляю")
         return
 
     errors = 0
@@ -407,8 +412,8 @@ async def dossier_cycle(service, repo, llm, sender, settings, now_utc: datetime 
         except Exception:
             log.exception("dossier update failed for %s", username)
             errors += 1
-    if errors:
-        await sender.notify_mentor(f"⚠️ Досье: {errors} ошибок, детали в логах")
+    await alert_once(repo, sender, "dossier_errors",
+                     "⚠️ Досье обновились не у всех — подробности в логах" if errors else "")
 
 
 async def backup_db(repo, sender, now_utc: datetime | None = None):

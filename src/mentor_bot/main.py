@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher
@@ -8,6 +9,7 @@ from mentor_bot.config import load_settings
 from mentor_bot.jobs import (
     backup_db, digest_cycle, dossier_cycle, drain_pending, ping_cycle, remind_cycle,
 )
+from mentor_bot.health import due_catch_ups, tracked
 from mentor_bot.kb import KBIndex, crawl, split_markdown
 from mentor_bot.llm import LLM
 from mentor_bot.routers import business, callbacks, commands
@@ -26,6 +28,8 @@ async def main():
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
     repo = await Repo.open(settings.db_path)
+    if released := await repo.release_stuck():
+        log.warning("released %d records stuck in 'sending' after restart", released)
     sheets = SheetsClient(settings.google_sa_path, settings.spreadsheet_id,
                           settings.active_sheet_titles, overrides=settings.header_overrides)
     llm = LLM(
@@ -88,42 +92,65 @@ async def main():
         await backup_db(repo, sender)
 
     async def nightly_backup():
-        try:
-            await backup_fn()
-        except Exception as e:
-            log.exception("backup failed")
-            await sender.notify_mentor(f"⚠️ Ночной бэкап упал: {e}")
+        await backup_fn()   # упадёт — предупредит обёртка tracked
 
     dp = Dispatcher()
     dp.include_router(commands.make_router(service, repo, sender, settings, reindex_fn, backup_fn))
     dp.include_router(callbacks.make_router(service, repo, sender))
     dp.include_router(business.make_router(service, repo, settings.mentor_user_id))
 
+    from apscheduler.events import EVENT_JOB_MISSED
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(ping_cycle, "cron", minute=7,
-                      args=[service, repo, sender, llm, settings],
-                      max_instances=1, coalesce=True)
-    scheduler.add_job(remind_cycle, "cron", minute="*/30", args=[repo, sender],
-                      kwargs={"settings": settings}, max_instances=1)
-    scheduler.add_job(drain_pending, "cron", minute="*",
-                      args=[service, repo, sender, settings],
-                      max_instances=1, coalesce=True)
-    scheduler.add_job(dossier_cycle, "cron", hour=settings.dossier_hour, minute=13,
-                      args=[service, repo, llm, sender, settings],
-                      timezone=ZoneInfo(settings.tz_name),
-                      max_instances=1, coalesce=True)
-    scheduler.add_job(digest_cycle, "cron", day_of_week=settings.digest_weekday,
-                      hour=settings.digest_hour, minute=3,
-                      args=[service, repo, sender, settings],
-                      timezone=ZoneInfo(settings.tz_name), max_instances=1, coalesce=True)
+    # misfire_grace_time по умолчанию — 1 секунда: занятый цикл событий (переиндексация,
+    # долгий запрос) молча отменял запуск. Частым задачам — 5 минут, редким — 6 часов
+    scheduler = AsyncIOScheduler(job_defaults={"misfire_grace_time": 300, "coalesce": True,
+                                               "max_instances": 1})
+    tz = ZoneInfo(settings.tz_name)
+    rare = {"misfire_grace_time": 6 * 3600, "timezone": tz}
+    jobs = {
+        "ping_cycle": (ping_cycle, [service, repo, sender, llm, settings], {}),
+        "remind_cycle": (remind_cycle, [repo, sender], {"settings": settings}),
+        "drain_pending": (drain_pending, [service, repo, sender, settings], {}),
+        "dossier_cycle": (dossier_cycle, [service, repo, llm, sender, settings], {}),
+        "digest_cycle": (digest_cycle, [service, repo, sender, settings], {}),
+        "nightly_backup": (nightly_backup, [], {}),
+    }
+
+    def add(name, trigger, **kw):
+        fn, args, kwargs = jobs[name]
+        scheduler.add_job(tracked(name, fn, repo, sender), trigger, id=name, args=args,
+                          kwargs=kwargs, **kw)
+
+    add("ping_cycle", "cron", minute=7)
+    add("remind_cycle", "cron", minute="*/30")
+    add("drain_pending", "cron", minute="*")
+    add("dossier_cycle", "cron", hour=settings.dossier_hour, minute=13, **rare)
+    add("digest_cycle", "cron", day_of_week=settings.digest_weekday,
+        hour=settings.digest_hour, minute=3, **rare)
     if settings.backup_hour >= 0:
-        scheduler.add_job(nightly_backup, "cron", hour=settings.backup_hour, minute=41,
-                          timezone=ZoneInfo(settings.tz_name), max_instances=1, coalesce=True)
+        add("nightly_backup", "cron", hour=settings.backup_hour, minute=41, **rare)
+
+    def on_missed(event):
+        # пропуск всё же случился (простой дольше допуска) — пусть будет виден в /health
+        asyncio.get_running_loop().create_task(repo.job_missed(event.job_id))
+
+    scheduler.add_listener(on_missed, EVENT_JOB_MISSED)
     scheduler.start()
+    # бот лежал, когда должна была пройти редкая задача, — догоняем сразу после старта
+    for name in due_catch_ups(await repo.job_runs(), datetime.now(timezone.utc)):
+        if scheduler.get_job(name):
+            log.info("catching up missed job %s", name)
+            scheduler.get_job(name).modify(next_run_time=datetime.now(tz) + timedelta(minutes=1))
 
     log.info("starting polling")
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        # без этого после падения polling оставался жив поток aiosqlite: процесс не выходил,
+        # и Docker с restart: unless-stopped не перезапускал мёртвого бота
+        scheduler.shutdown(wait=False)
+        await repo.close()
+        await bot.session.close()
 
 
 if __name__ == "__main__":

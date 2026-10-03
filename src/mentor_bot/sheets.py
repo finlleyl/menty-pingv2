@@ -358,6 +358,7 @@ def _ensure_grid(ws, row: int, col: int) -> None:
 # и чтение шапки на каждую запись съедало бы квоту Sheets API (60 чтений в минуту).
 # Цена — колонку, вставленную меньше минуты назад, бот увидит только после истечения кэша.
 HEADER_TTL = 60.0
+SHEETS_TIMEOUT = 30.0   # секунд на запрос к Google Sheets
 
 
 class SheetsClient:
@@ -377,6 +378,8 @@ class SheetsClient:
         if self._book is None:
             import gspread
             gc = gspread.service_account(filename=self._sa_path)
+            # без таймаута зависший запрос держал поток и ожидающую корутину бесконечно
+            gc.set_timeout(SHEETS_TIMEOUT)
             self._book = gc.open_by_key(self._spreadsheet_id)
         return self._book
 

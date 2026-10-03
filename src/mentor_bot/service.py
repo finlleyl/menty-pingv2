@@ -8,6 +8,7 @@ import numpy as np
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from mentor_bot.cards import card_id, escalation_kb, hhmm, open_chat_row
+from mentor_bot.health import alert_once
 from mentor_bot.llm import looks_like_interview, looks_like_verdict
 from mentor_bot.pings import parse_iso_utc
 from mentor_bot.sheets import SheetSchemaChanged, report_problems
@@ -122,6 +123,7 @@ class Service:
             if m.sheet_title in failed and username not in fresh:
                 fresh[username] = m
         self.by_username = fresh
+        await self.repo.set_setting("last_sync", datetime.now(timezone.utc).isoformat())
         await self.alert_once("sheets", "\n".join(report_problems(reports)))
         now_iso = datetime.now(timezone.utc).isoformat()
         # по by_username, а не по строкам: ник, записанный дважды, иначе «прыгал» бы
@@ -142,14 +144,8 @@ class Service:
         return out
 
     async def alert_once(self, key: str, text: str):
-        """Предупреждение ментору без повторов: то же самое не шлём, пока проблема не сменится
-        или не уйдёт. Пустой text — проблемы нет, следующее появление снова придёт."""
-        prev = await self.repo.get_setting(f"alert:{key}", "")
-        if text == prev:
-            return
-        await self.repo.set_setting(f"alert:{key}", text)
-        if text:
-            await self.sender.notify_mentor(text)
+        """Предупреждение без повторов (см. health.alert_once); пустой text — проблема ушла."""
+        await alert_once(self.repo, self.sender, key, text)
 
     async def _propose(self, username: str, m, new_status: str, text: str, prefix: str,
                        hint: str = ""):
@@ -182,6 +178,12 @@ class Service:
                 await self.alert_once(f"schema:{e.title}",
                                       f"⚠️ Лист «{e.title}»: {e.problem} — даты не пишу")
                 return
+            except Exception as e:
+                log.exception("sheet date update failed for %s", username)
+                await self.alert_once("date_write", f"⚠️ Не могу записать даты в таблицу "
+                                                    f"({type(e).__name__}) — проверь доступ")
+                return
+            await self.alert_once("date_write", "")
             m.last_date = msg_date
 
     async def count_ping(self, username: str, ts_iso: str):
@@ -220,10 +222,7 @@ class Service:
         else:
             await self.repo.reset_unanswered(username)
             await self.repo.clear_reply_pause(username)
-        try:
-            await self._touch_sheet_date(username, ts_iso)
-        except Exception:
-            log.exception("sheet date update failed")
+        await self._touch_sheet_date(username, ts_iso)
         if direction == "in":
             # ученик ещё пишет — продлеваем окно дебаунса, если буфер уже открыт
             await self.repo.touch_pending(username, ts_iso)
@@ -248,11 +247,7 @@ class Service:
         # ментор ответил сам — накопленное обрабатывать не нужно
         await self.repo.drop_pending(username)
         await self.close_cards(closed, "💬 Ответил в чате", username)
-        try:
-            await self._touch_sheet_date(username, ts_iso)
-        except Exception:
-            log.exception("sheet date update failed")
-            await self.sender.notify_mentor(f"⚠️ Не смог обновить дату в таблице для @{username}")
+        await self._touch_sheet_date(username, ts_iso)
         if looks_like_verdict(text):
             try:
                 await self._propose_from_verdict(username, text)
@@ -276,11 +271,7 @@ class Service:
             return  # Telegram доставил апдейт повторно
         await self.repo.reset_unanswered(username)
         await self.repo.clear_reply_pause(username)
-        try:
-            await self._touch_sheet_date(username, ts_iso)
-        except Exception:
-            log.exception("sheet date update failed")
-            await self.sender.notify_mentor(f"⚠️ Не смог обновить дату в таблице для @{username}")
+        await self._touch_sheet_date(username, ts_iso)
         # ученик вышел на связь — пинг, ждущий одобрения или ручной отправки, больше не нужен
         await self.close_cards(await self.repo.close_ping_drafts(username),
                                "⏭ Ученик написал сам", username)
