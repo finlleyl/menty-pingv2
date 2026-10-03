@@ -26,7 +26,8 @@ async def main():
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
     repo = await Repo.open(settings.db_path)
-    sheets = SheetsClient(settings.google_sa_path, settings.spreadsheet_id, settings.active_sheet_titles)
+    sheets = SheetsClient(settings.google_sa_path, settings.spreadsheet_id,
+                          settings.active_sheet_titles, overrides=settings.header_overrides)
     llm = LLM(
         settings.llm_api_key, settings.llm_model_smart, settings.llm_model_fast, settings.embed_model,
         base_url=settings.llm_base_url, usage_sink=repo.log_usage,

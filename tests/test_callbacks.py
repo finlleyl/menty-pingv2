@@ -264,3 +264,17 @@ async def test_status_and_add_cards_are_closed(tmp_path):
     await handle_add_callback("add:skip:mama", repo, sender, svc, card=603)
     assert sender.closed_cards == [(601, "✅ «Собесы»"), (602, "❌ Статус не меняем"),
                                    (603, "🚫 Не менти")]
+
+
+async def test_status_write_refused_on_broken_sheet_header_keeps_the_proposal(tmp_path):
+    from mentor_bot.sheets import SheetSchemaChanged
+    repo, sheets, sender, svc = await make(tmp_path)
+    pid = await repo.add_proposal("ivan", "Собесы", "3 спринт")
+
+    async def broken(m, s, expected=None):
+        raise SheetSchemaChanged("A", "пропала колонка статуса")
+
+    sheets.set_status = broken
+    out = await handle_st_callback(f"st:yes:{pid}", repo, sender, svc)
+    assert out == "Не пишу в таблицу: пропала колонка статуса"
+    assert await repo.get_proposal(pid) is not None         # нажмёшь, когда починишь шапку

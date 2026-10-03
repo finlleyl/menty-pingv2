@@ -774,3 +774,49 @@ async def test_status_proposal_card_is_remembered(tmp_path):
         status=StatusUpdate(new_status="Собесы", confidence="high"))
     await svc.handle_buffered("ivan", "завтра первый собес", TS)
     assert (await repo.get_proposal(1))["card_msg_id"] == 1001
+
+
+async def test_sheet_problems_are_reported_once_until_they_change(tmp_path):
+    from mentor_bot.sheets import SheetReport
+    repo, sheets, sender, svc = await make(tmp_path)
+    broken = [SheetReport("A", True, mentees=1), SheetReport("B", False, "лист не найден — проверь ACTIVE_SHEETS")]
+    sheets.last_report = broken
+    await svc.sync_mentees()
+    await svc.sync_mentees()                         # тот же сбой — второй раз не пишем
+    alerts = [t for t, _ in sender.mentor_msgs if "Лист «B»" in t]
+    assert len(alerts) == 1
+    sheets.last_report = [SheetReport("A", True, mentees=1), SheetReport("B", True)]
+    await svc.sync_mentees()                         # починили — молчим
+    sheets.last_report = broken
+    await svc.sync_mentees()                         # сломали снова — снова предупреждаем
+    assert len([t for t, _ in sender.mentor_msgs if "Лист «B»" in t]) == 2
+
+
+async def test_unreadable_sheet_keeps_its_mentees_from_the_last_sync(tmp_path):
+    from mentor_bot.sheets import SheetReport
+    repo = await Repo.open(str(tmp_path / "t.db"))
+    sheets = FakeSheets([sm("ivan"), SheetMentee(username="petr", display="@petr", status=None,
+                                                 last_date=None, sheet_title="B", row=2,
+                                                 date_col=4, status_col=5)])
+    svc = Service(repo, sheets, FakeLLM(), FakeSender(), FakeKB(), FakeSettings())
+    await svc.sync_mentees()
+    sheets.mentees = [sm("ivan")]                    # лист B не прочитался
+    sheets.last_report = [SheetReport("A", True, mentees=1), SheetReport("B", False, "не прочитан")]
+    await svc.sync_mentees()
+    assert set(svc.by_username) == {"ivan", "petr"}
+    await repo.close()
+
+
+async def test_broken_header_stops_date_writes_with_one_alert(tmp_path):
+    from mentor_bot.sheets import SheetSchemaChanged
+    repo, sheets, sender, svc = await make(tmp_path)
+
+    async def broken(m, d):
+        raise SheetSchemaChanged("A", "неясно, где дата контакта: «Дата» или «Дата»")
+
+    sheets.set_date = broken
+    await svc.on_incoming("ivan", "привет", "2026-08-19T10:00:00+00:00", tg_id=1)
+    await svc.on_incoming("ivan", "ау", "2026-08-20T10:00:00+00:00", tg_id=2)
+    alerts = [t for t, _ in sender.mentor_msgs if "Лист «A»" in t]
+    assert alerts == ["⚠️ Лист «A»: неясно, где дата контакта: «Дата» или «Дата» — даты не пишу"]
+    assert (await repo.get_pending("ivan"))["texts"] == ["привет", "ау"]   # сообщения не потеряны

@@ -5,7 +5,7 @@ from aiogram import F, Router
 from aiogram.types import CallbackQuery
 
 from mentor_bot.cards import NOOP, hhmm
-from mentor_bot.sheets import RowNotFound, StatusConflict
+from mentor_bot.sheets import RowNotFound, SheetSchemaChanged, StatusConflict
 from mentor_bot.store.repo import SRC_BOT, SRC_BOT_EDIT
 from mentor_bot.style import todo_marks
 
@@ -164,6 +164,9 @@ async def handle_st_callback(data: str, repo, sender, service, card=None) -> str
         await repo.delete_proposal(p["id"])
         await sender.close_card(card, "⏭ Нет в таблице", user)
         return f"@{p['username']} больше нет в таблице"
+    except SheetSchemaChanged as e:
+        # повтор не поможет, пока не починят шапку; предложение не удаляем — нажмёшь потом
+        return f"Не пишу в таблицу: {e.problem}"[:200]
     except Exception:
         log.exception("set_status failed for @%s", p["username"])
         return "Ошибка записи в таблицу, нажми ещё раз"

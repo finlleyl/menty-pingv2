@@ -10,6 +10,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from mentor_bot.cards import card_id, open_chat_row
 from mentor_bot.llm import looks_like_interview, looks_like_verdict
 from mentor_bot.pings import parse_iso_utc
+from mentor_bot.sheets import SheetSchemaChanged, report_problems
 from mentor_bot.stages import STAGE_LABELS, call_permission, mentee_may_propose, parse_stage
 from mentor_bot.store.repo import KIND_HUMAN, KIND_QUESTION
 from mentor_bot.style import TECH_KINDS, draft_problems, normalize_dashes, todo_marks
@@ -111,7 +112,17 @@ class Service:
 
     async def sync_mentees(self):
         mentees = await self.sheets.load_mentees()
-        self.by_username = {m.username: m for m in mentees}
+        reports = getattr(self.sheets, "last_report", [])
+        fresh = {m.username: m for m in mentees}
+        # лист не прочитался (переименовали, сбили шапку, Google прилёг) — его учеников держим
+        # из прошлого синка: иначе они «выпали» бы из бота и каждое их сообщение спрашивало бы
+        # «Новый чат — добавить?»
+        failed = {r.title for r in reports if not r.ok}
+        for username, m in self.by_username.items():
+            if m.sheet_title in failed and username not in fresh:
+                fresh[username] = m
+        self.by_username = fresh
+        await self.alert_once("sheets", "\n".join(report_problems(reports)))
         now_iso = datetime.now(timezone.utc).isoformat()
         # по by_username, а не по строкам: ник, записанный дважды, иначе «прыгал» бы
         # между двумя статусами на каждой синхронизации и засорял историю
@@ -120,6 +131,16 @@ class Service:
             # ручные правки статуса в таблице тоже попадают в историю и сдвигают status_since
             await self.repo.record_status(m.username, m.status, now_iso, "sheet")
         return self.by_username
+
+    async def alert_once(self, key: str, text: str):
+        """Предупреждение ментору без повторов: то же самое не шлём, пока проблема не сменится
+        или не уйдёт. Пустой text — проблемы нет, следующее появление снова придёт."""
+        prev = await self.repo.get_setting(f"alert:{key}", "")
+        if text == prev:
+            return
+        await self.repo.set_setting(f"alert:{key}", text)
+        if text:
+            await self.sender.notify_mentor(text)
 
     async def _propose(self, username: str, m, new_status: str, text: str, prefix: str,
                        hint: str = ""):
@@ -144,7 +165,14 @@ class Service:
             return
         msg_date = datetime.fromisoformat(ts_iso).astimezone(ZoneInfo(self.settings.tz_name)).date()
         if m.last_date is None or msg_date > m.last_date:
-            await self.sheets.set_date(m, msg_date)
+            try:
+                await self.sheets.set_date(m, msg_date)
+            except SheetSchemaChanged as e:
+                # шапку листа сбили — писать дату нельзя, но и предупреждать на каждое
+                # сообщение ученика незачем: одно предупреждение, пока проблема та же
+                await self.alert_once(f"schema:{e.title}",
+                                      f"⚠️ Лист «{e.title}»: {e.problem} — даты не пишу")
+                return
             m.last_date = msg_date
 
     async def on_contact_only(self, username: str, direction: str, ts_iso: str, tg_id=None):
