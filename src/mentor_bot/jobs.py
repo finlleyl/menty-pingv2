@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup
 
 from mentor_bot.cards import card_id, hhmm, open_chat_row
 from mentor_bot.llm import LLMUnavailable
@@ -25,6 +25,10 @@ from mentor_bot.style import ai_tells, normalize_dashes
 
 log = logging.getLogger(__name__)
 
+# Пинг, который ждёт ментора (на одобрении или «отправь сам»), живёт двое суток: забытый
+# черновик раньше навсегда блокировал пинги ученику — новый не готовился, пока висит старый
+PING_DRAFT_TTL = timedelta(hours=48)
+
 
 async def ping_cycle(service, repo, sender, llm, settings, now_utc: datetime | None = None):
     now_utc = now_utc or datetime.now(timezone.utc)
@@ -39,6 +43,9 @@ async def ping_cycle(service, repo, sender, llm, settings, now_utc: datetime | N
         log.exception("sheet sync failed")
         await sender.notify_mentor("⚠️ Не смог прочитать таблицу, цикл пингов пропущен")
         return
+
+    for d in await repo.expire_ping_drafts((now_utc - PING_DRAFT_TTL).isoformat()):
+        await sender.close_card(d["card_msg_id"], "⌛ Истёк", d["username"])
 
     errors = 0
     samples = None
@@ -128,11 +135,16 @@ async def ping_cycle(service, repo, sender, llm, settings, now_utc: datetime | N
         await repo.log_ping(username, now_utc.isoformat(), "attempt")
         try:
             result = await sender.send_to_mentee(username, text)
+            if result == "window_closed":
+                # ученик молчит дольше суток — Telegram бота к нему не пустит, пингует ментор
+                await hand_over_ping(username, m, text, service, repo, sender, settings, now_utc,
+                                     silent_days=(now_utc - last).days if last else None)
+                continue
+            await after_ping(result, username, m, text, service, repo, sender, settings, now_utc)
         except Exception:
             log.exception("ping send failed for %s", username)
             errors += 1
             continue
-        await after_ping(result, username, m, text, service, repo, sender, settings, now_utc)
         if result == "sent":
             await asyncio.sleep(58)  # rate limit ≤1 пинг/мин
 
@@ -141,15 +153,73 @@ async def ping_cycle(service, repo, sender, llm, settings, now_utc: datetime | N
 
 
 
+def _snooze_row(pid: int) -> list[InlineKeyboardButton]:
+    """«Не сейчас» одним тапом: следующий пинг через 3 или 7 дней или после ответа ученика."""
+    return [
+        InlineKeyboardButton(text="⏸ 3 дн", callback_data=f"p:snooze:{pid}:3"),
+        InlineKeyboardButton(text="⏸ 7 дн", callback_data=f"p:snooze:{pid}:7"),
+        InlineKeyboardButton(text="🔕 До ответа", callback_data=f"p:until:{pid}"),
+    ]
+
+
 def ping_draft_kb(pid: int, username: str | None = None) -> InlineKeyboardMarkup:
     rows = [[
         InlineKeyboardButton(text="Отправить", callback_data=f"p:send:{pid}"),
         InlineKeyboardButton(text="✏️ Править", callback_data=f"p:edit:{pid}"),
         InlineKeyboardButton(text="Пропустить", callback_data=f"p:skip:{pid}"),
-    ]]
+    ], _snooze_row(pid)]
     if username:
         rows.append(open_chat_row(username))
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# у кнопки «скопировать» Telegram ограничивает текст 256 символами
+COPY_LIMIT = 256
+
+
+def handoff_kb(pid: int, username: str, text: str) -> InlineKeyboardMarkup:
+    """Пинг, который ментор отправляет сам: скопировать текст, открыть чат, отложить."""
+    rows = []
+    if len(text) <= COPY_LIMIT:
+        rows.append([InlineKeyboardButton(text="📋 Скопировать текст",
+                                          copy_text=CopyTextButton(text=text))])
+    rows += [open_chat_row(username), _snooze_row(pid),
+             [InlineKeyboardButton(text="Пропустить", callback_data=f"p:skip:{pid}")]]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def hand_over_ping(username, m, text, service, repo, sender, settings, now_utc,
+                         silent_days=None, pid=None):
+    """Окно 24 часа закрыто — пинг уходит ментору карточкой «отправь сам». Его ручное
+    сообщение ученику засчитается как пинг (Service._mentor_wrote). pid — черновик
+    из режима одобрения, который превращается в такую карточку."""
+    if pid is None:
+        pid = await repo.add_ping_draft(username, text, now_utc.isoformat())
+    else:
+        await repo.set_ping_draft_text(pid, text)
+    await repo.set_ping_draft_state(pid, "handoff")
+    await repo.log_ping(username, now_utc.isoformat(), "handoff")
+    stage = parse_stage(m.status)
+    silent = f", молчит {silent_days} дн." if silent_days else ""
+    copy_hint = "скопируй кнопкой и открой чат" if len(text) <= COPY_LIMIT else "скопируй и открой чат"
+    msg = await sender.notify_mentor(
+        f"📨 Пинг для @{username} ({STAGE_LABELS[stage]}{silent}) — отправь сам.\n"
+        f"Бот написать не может: Telegram пускает его только в чаты, где ученик писал за "
+        f"последние сутки. Текст готов — {copy_hint}:\n\n{text}",
+        reply_markup=handoff_kb(pid, username, text),
+    )
+    await repo.set_card("ping_drafts", pid, card_id(msg))
+    await _resume_reminder(username, m, repo, sender, now_utc)
+    return pid
+
+
+async def _resume_reminder(username, m, repo, sender, now_utc):
+    """Стадия «Резюме» — мяч у ментора: вместе с пингом напоминаем, что резюме за ним."""
+    if parse_stage(m.status) != "resume":
+        return
+    since = (await repo.get_mentee(username) or {}).get("status_since")
+    waiting = f" — ждёт уже {(now_utc - parse_iso_utc(since)).days} дн." if since else ""
+    await sender.notify_mentor(f"📝 @{username} ждёт от тебя резюме{waiting}")
 
 
 async def after_ping(result, username, m, text, service, repo, sender, settings, now_utc,
@@ -157,34 +227,25 @@ async def after_ping(result, username, m, text, service, repo, sender, settings,
     """Учёт после отправки пинга — общий для цикла и для одобренных черновиков.
     source — чей текст ушёл: модели (SRC_BOT) или правка ментора (SRC_BOT_EDIT)."""
     tz = ZoneInfo(settings.tz_name)
-    if result in ("sent", "dry") and parse_stage(m.status) == "resume":
-        # мяч у ментора: ученику пинг, ментору напоминание, что резюме за ним
-        since = (await repo.get_mentee(username) or {}).get("status_since")
-        waiting = ""
-        if since:
-            waiting = f" — ждёт уже {(now_utc - parse_iso_utc(since)).days} дн."
-        await sender.notify_mentor(f"📝 @{username} ждёт от тебя резюме{waiting}")
-
     if result == "sent":
-        await repo.log_ping(username, now_utc.isoformat(), "sent")
-        await repo.bump_unanswered(username)
+        # сначала учёт: упади что-то ниже, ушедший пинг всё равно засчитан, и завтра не
+        # уйдёт дубль. Эхо этой отправки бизнес-роутер пропускает — в переписку пишем сами
+        await repo.log_message(username, "out", text, now_utc.isoformat(), source=source)
         await repo.set_setting("alerted_no_bconn", "")
-        rec2 = await repo.get_mentee(username) or {}
-        if rec2.get("unanswered_pings", 0) >= settings.max_unanswered_pings:
-            await sender.notify_mentor(
-                f"🚨 @{username} игнорит {settings.max_unanswered_pings} пинга подряд — "
-                f"дальше не пингую, разберись вручную"
-            )
+        await service.count_ping(username, now_utc.isoformat())
         try:
             await service.sheets.set_date(m, now_utc.astimezone(tz).date())
             m.last_date = now_utc.astimezone(tz).date()
         except Exception:
             log.exception("sheet date write failed after ping")
             await sender.notify_mentor(f"⚠️ Пинг @{username} ушёл, но дата в таблице не записана")
-        # эхо этой отправки бизнес-роутер пропускает — в переписку пинг пишем сами
-        await repo.log_message(username, "out", text, now_utc.isoformat(), source=source)
     elif result == "dry":
         await repo.log_ping(username, now_utc.isoformat(), "dry")
+    if result in ("sent", "dry"):
+        try:
+            await _resume_reminder(username, m, repo, sender, now_utc)
+        except Exception:
+            log.exception("resume reminder failed for %s", username)
 
 
 @dataclass
@@ -235,6 +296,12 @@ async def send_ping_draft(pid, service, repo, sender, settings, text=None,
         log.exception("ping draft send failed for %s", username)
         await repo.set_ping_draft_state(pid, "open")
         return DraftOutcome("Ошибка отправки", retry=True)
+    if result == "window_closed":
+        # на этой карточке остался текст модели, а уйти может твоя правка — новая карточка
+        await sender.close_card(card, "➡️ Отправь сам — карточка ниже", username)
+        await hand_over_ping(username, m, text, service, repo, sender, settings, now_utc, pid=pid)
+        return DraftOutcome(f"Бот не может написать @{username} сам — отправь вручную, "
+                            f"текст в карточке ниже")
     if result not in ("sent", "dry"):
         await repo.set_ping_draft_state(pid, "open")
         return DraftOutcome(f"Не отправлено: {result}", retry=True)

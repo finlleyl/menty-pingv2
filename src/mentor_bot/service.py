@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from mentor_bot.cards import card_id, open_chat_row
+from mentor_bot.cards import card_id, escalation_kb, hhmm, open_chat_row
 from mentor_bot.llm import looks_like_interview, looks_like_verdict
 from mentor_bot.pings import parse_iso_utc
 from mentor_bot.sheets import SheetSchemaChanged, report_problems
@@ -175,11 +175,42 @@ class Service:
                 return
             m.last_date = msg_date
 
+    async def count_ping(self, username: str, ts_iso: str):
+        """Пинг ушёл — от бота или руками ментора по карточке. После N подряд без ответа —
+        стоп и вопрос ментору, что делать, с кнопками, а не тупиковое «разберись вручную»."""
+        await self.repo.log_ping(username, ts_iso, "sent")
+        await self.repo.bump_unanswered(username)
+        limit = getattr(self.settings, "max_unanswered_pings", 3)
+        rec = await self.repo.get_mentee(username) or {}
+        if rec.get("unanswered_pings", 0) >= limit:
+            await self.sender.notify_mentor(
+                f"🚨 @{username} не ответил на {limit} пинга подряд — дальше не пингую. Что делаем?",
+                reply_markup=escalation_kb(username),
+            )
+
+    async def _mentor_wrote(self, username: str, ts_iso: str):
+        """Ментор написал ученику сам. Ждала карточка «отправь сам» — это и есть пинг: его
+        считаем, а счётчик игнора не обнуляем, иначе стоп после N пингов не сработал бы."""
+        handed = await self.repo.close_ping_drafts(username, state="sent_manual",
+                                                   states=("handoff",))
+        if handed:
+            await self.count_ping(username, ts_iso)
+            await self.close_cards(handed, f"✅ Отправил сам {hhmm(self.settings.tz_name)}",
+                                   username)
+        else:
+            await self.repo.reset_unanswered(username)
+        await self.close_cards(await self.repo.close_ping_drafts(username), "💬 Ответил в чате",
+                               username)
+
     async def on_contact_only(self, username: str, direction: str, ts_iso: str, tg_id=None):
         """Медиа без текста: фиксируем контакт без классификации."""
         if not await self.repo.log_message(username, direction, "[медиа]", ts_iso, tg_id=tg_id):
             return  # Telegram доставил апдейт повторно
-        await self.repo.reset_unanswered(username)
+        if direction == "out":
+            await self._mentor_wrote(username, ts_iso)   # голосовое ментора — тоже ответ
+        else:
+            await self.repo.reset_unanswered(username)
+            await self.repo.clear_reply_pause(username)
         try:
             await self._touch_sheet_date(username, ts_iso)
         except Exception:
@@ -195,7 +226,7 @@ class Service:
         if not await self.repo.log_message(username, "out", text, ts_iso, tg_id=tg_id,
                                            reply_to_tg_id=reply_to_tg_id):
             return  # Telegram доставил апдейт повторно
-        await self.repo.reset_unanswered(username)
+        await self._mentor_wrote(username, ts_iso)
         # ответил reply-ем на сообщение вопроса — это ответ ровно на него: остальные вопросы
         # ученика остаются открытыми, и чужой ответ в них не попадёт
         q = (await self.repo.question_for_message(username, reply_to_tg_id)
@@ -205,9 +236,8 @@ class Service:
         await self.repo.record_manual_answer(username, text, datetime.fromisoformat(ts_iso),
                                              question_id=qid)
         closed = await self.repo.close_open_questions(username, question_id=qid)
-        # ментор ответил сам — накопленное обрабатывать не нужно, ждущий пинг тоже
+        # ментор ответил сам — накопленное обрабатывать не нужно
         await self.repo.drop_pending(username)
-        closed += await self.repo.close_ping_drafts(username)
         await self.close_cards(closed, "💬 Ответил в чате", username)
         try:
             await self._touch_sheet_date(username, ts_iso)
@@ -236,12 +266,13 @@ class Service:
         if not await self.repo.log_message(username, "in", text, ts_iso, tg_id=tg_id):
             return  # Telegram доставил апдейт повторно
         await self.repo.reset_unanswered(username)
+        await self.repo.clear_reply_pause(username)
         try:
             await self._touch_sheet_date(username, ts_iso)
         except Exception:
             log.exception("sheet date update failed")
             await self.sender.notify_mentor(f"⚠️ Не смог обновить дату в таблице для @{username}")
-        # ученик вышел на связь — пинг, ждущий одобрения, больше не нужен
+        # ученик вышел на связь — пинг, ждущий одобрения или ручной отправки, больше не нужен
         await self.close_cards(await self.repo.close_ping_drafts(username),
                                "⏭ Ученик написал сам", username)
         # LLM здесь НЕ дёргаем: копим в буфер, обработает drain_pending

@@ -458,3 +458,125 @@ async def test_remind_cycle_wording_for_human_drafts(tmp_path):
     await repo.add_question("ivan", "выгорел", "бывает", "2026-08-20T05:00:00+00:00", kind="human")
     await remind_cycle(repo, sender, now_utc=NOON_UTC)
     assert sender.mentor_msgs[0][0].startswith("⏰ Висит без ответа сообщение от @ivan")
+
+
+class WindowClosedSender(SendingSender):
+    """Telegram не пускает бота: ученик не писал больше суток."""
+
+    async def send_to_mentee(self, username, text):
+        if await self.repo.get_setting("dryrun", "1") == "1":
+            return await super().send_to_mentee(username, text)
+        return "window_closed"
+
+
+async def make_closed(tmp_path):
+    repo, sheets, _, llm, svc = await make(tmp_path)
+    sender = WindowClosedSender(repo)
+    svc.sender = sender
+    await _live(repo)
+    return repo, sheets, sender, llm, svc
+
+
+async def test_closed_window_hands_the_ping_to_the_mentor(tmp_path):
+    repo, sheets, sender, llm, svc = await make_closed(tmp_path)
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC)
+    d = await repo.open_ping_draft("ivan")
+    assert d["state"] == "handoff" and d["text"] == "ПИНГ[Иван @ivan]"
+    text, markup = sender.mentor_msgs[-1]
+    assert "отправь сам" in text and "ПИНГ[Иван @ivan]" in text
+    buttons = [b for row in markup.inline_keyboard for b in row]
+    assert buttons[0].copy_text.text == "ПИНГ[Иван @ivan]"
+    assert any(b.url == "https://t.me/ivan" for b in buttons)
+    assert (await repo.get_mentee("ivan"))["unanswered_pings"] == 0   # ещё не ушёл
+    assert sheets.dates == []                                          # и дата не та
+    # в тот же день второй карточки нет
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC + timedelta(hours=1))
+    assert len(llm.gen_ping_calls) == 1
+
+
+async def test_mentor_sending_it_by_hand_counts_as_the_ping(tmp_path):
+    repo, sheets, sender, llm, svc = await make_closed(tmp_path)
+    await svc.sync_mentees()
+    await repo.bump_unanswered("ivan")                # один пинг уже без ответа
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC)
+    card = (await repo.open_ping_draft("ivan"))["card_msg_id"]
+    await svc.on_outgoing("ivan", "ПИНГ[Иван @ivan]", "2026-08-20T12:05:00+00:00", tg_id=9)
+    assert (await repo.get_mentee("ivan"))["unanswered_pings"] == 2   # засчитан, а не обнулён
+    assert await repo.open_ping_draft("ivan") is None
+    assert sender.closed_cards[-1][0] == card and sender.closed_cards[-1][1].startswith("✅ Отправил сам")
+
+
+async def test_mentee_writing_first_closes_the_handoff(tmp_path):
+    repo, sheets, sender, llm, svc = await make_closed(tmp_path)
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC)
+    await svc.on_incoming("ivan", "я тут!", "2026-08-20T12:30:00+00:00", tg_id=5)
+    assert await repo.open_ping_draft("ivan") is None
+    assert sender.closed_cards[-1][1] == "⏭ Ученик написал сам"
+
+
+async def test_approved_ping_with_closed_window_becomes_a_handoff(tmp_path):
+    from mentor_bot.routers.callbacks import handle_p_callback
+    repo, sheets, sender, llm, svc = await make_closed(tmp_path)
+    await svc.sync_mentees()
+    await repo.set_setting("ping_mode", "review")
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC)
+    d = await repo.open_ping_draft("ivan")
+    out = await handle_p_callback(f"p:send:{d['id']}", repo, sender, svc)
+    assert "отправь вручную" in out
+    assert (await repo.get_ping_draft(d["id"]))["state"] == "handoff"
+    assert sender.closed_cards[-1] == (d["card_msg_id"], "➡️ Отправь сам — карточка ниже")
+    assert "отправь сам" in sender.mentor_msgs[-1][0]
+
+
+async def test_snooze_buttons_pause_the_mentee(tmp_path):
+    from mentor_bot.routers.callbacks import handle_p_callback
+    repo, sheets, sender, llm, svc = await make_closed(tmp_path)
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC)
+    d = await repo.open_ping_draft("ivan")
+    out = await handle_p_callback(f"p:snooze:{d['id']}:7", repo, sender, svc)
+    assert out.startswith("Ок, следующий пинг @ivan не раньше")
+    paused = (await repo.get_mentee("ivan"))["paused_until"]
+    assert paused > (datetime.now(timezone.utc) + timedelta(days=6)).isoformat()
+    assert sender.closed_cards[-1][1].startswith("⏸ До ")
+
+
+async def test_until_reply_pause_ends_when_the_mentee_writes(tmp_path):
+    from mentor_bot.routers.callbacks import handle_p_callback
+    from mentor_bot.store.repo import UNTIL_REPLY
+    repo, sheets, sender, llm, svc = await make_closed(tmp_path)
+    await svc.sync_mentees()
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC)
+    d = await repo.open_ping_draft("ivan")
+    await handle_p_callback(f"p:until:{d['id']}", repo, sender, svc)
+    assert (await repo.get_mentee("ivan"))["paused_until"] == UNTIL_REPLY
+    await svc.on_incoming("ivan", "привет", "2026-08-25T10:00:00+00:00", tg_id=3)
+    assert (await repo.get_mentee("ivan"))["paused_until"] is None
+
+
+async def test_forgotten_ping_draft_expires_and_unblocks_pings(tmp_path):
+    repo, sheets, sender, llm, svc = await make(tmp_path)
+    await _live(repo)
+    pid = await repo.add_ping_draft("ivan", "куда пропал?", "2026-08-17T12:00:00+00:00")
+    await repo.set_card("ping_drafts", pid, 900)
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC)
+    assert (await repo.get_ping_draft(pid))["state"] == "expired"
+    assert (900, "⌛ Истёк") in sender.closed_cards
+    assert sender.mentee_msgs == [("ivan", "ПИНГ[Иван @ivan]")]      # новый пинг ушёл
+
+
+async def test_ignored_pings_escalate_with_buttons(tmp_path):
+    from mentor_bot.routers.callbacks import handle_esc_callback
+    repo, sheets, sender, llm, svc = await make(tmp_path)
+    await _live(repo)
+    for _ in range(2):
+        await repo.bump_unanswered("ivan")
+    await ping_cycle(svc, repo, sender, llm, Cfg2(), now_utc=NOON_UTC)
+    text, markup = next((t, k) for t, k in sender.mentor_msgs if t.startswith("🚨"))
+    datas = [b.callback_data for row in markup.inline_keyboard for b in row if b.callback_data]
+    assert datas == ["esc:reset:ivan", "esc:pause:ivan:14"]
+    out = await handle_esc_callback("esc:pause:ivan:14", repo, sender, svc, card=77)
+    rec = await repo.get_mentee("ivan")
+    assert rec["unanswered_pings"] == 0 and rec["paused_until"]
+    assert out.startswith("Ок, @ivan снова пингую после")
+    await handle_esc_callback("esc:reset:ivan", repo, sender, svc, card=77)
+    assert (await repo.get_mentee("ivan"))["paused_until"] is None

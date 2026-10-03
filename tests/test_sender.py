@@ -72,3 +72,26 @@ async def test_close_card_replaces_buttons_and_survives_telegram_errors(tmp_path
     assert markup.inline_keyboard[0][0].text == "✅ Отправлено 14:32"
     assert markup.inline_keyboard[1][0].url == "https://t.me/ivan"
     assert len(edits) == 2
+
+
+async def test_closed_business_window_is_a_result_not_an_error(tmp_path):
+    import pytest
+    from aiogram.exceptions import TelegramBadRequest
+    from aiogram.methods import SendMessage
+    bot, repo = await make(tmp_path)
+    await repo.set_setting("dryrun", "0")
+    s = Sender(bot, repo, mentor_user_id=999)
+
+    async def refuse(chat_id, text, business_connection_id=None, reply_markup=None):
+        raise TelegramBadRequest(SendMessage(chat_id=chat_id, text=text),
+                                 "Bad Request: BUSINESS_PEER_USAGE_MISSING")
+
+    bot.send_message = refuse
+    assert await s.send_to_mentee("ivan", "привет") == "window_closed"
+
+    async def broken(chat_id, text, business_connection_id=None, reply_markup=None):
+        raise TelegramBadRequest(SendMessage(chat_id=chat_id, text=text), "Bad Request: chat not found")
+
+    bot.send_message = broken
+    with pytest.raises(TelegramBadRequest):
+        await s.send_to_mentee("ivan", "привет")

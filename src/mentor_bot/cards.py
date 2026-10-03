@@ -34,3 +34,12 @@ def done_kb(label: str, username: str | None = None) -> InlineKeyboardMarkup:
 def hhmm(tz_name: str, now: datetime | None = None) -> str:
     """Время для итога на карточке — по часам ментора, а не UTC."""
     return (now or datetime.now(timezone.utc)).astimezone(ZoneInfo(tz_name)).strftime("%H:%M")
+
+
+def escalation_kb(username: str) -> InlineKeyboardMarkup:
+    """Ученик игнорит пинги: пинговать снова, отложить на две недели или написать самому."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔁 Пинговать снова", callback_data=f"esc:reset:{username}"),
+         InlineKeyboardButton(text="⏸ Через 14 дн", callback_data=f"esc:pause:{username}:14")],
+        open_chat_row(username),
+    ])

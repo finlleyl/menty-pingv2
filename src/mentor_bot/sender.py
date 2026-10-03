@@ -1,11 +1,16 @@
 import asyncio
 import logging
 
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import BufferedInputFile
 
 from mentor_bot.cards import done_kb
 
 log = logging.getLogger(__name__)
+
+# Бизнес-бот пишет только в чаты, где ученик писал за последние 24 часа: иначе Telegram
+# отвечает этими ошибками. Это не сбой — пинг надо отдать ментору, чтобы отправил сам
+WINDOW_ERRORS = ("BUSINESS_PEER_USAGE_MISSING", "BUSINESS_PEER_INVALID")
 
 
 class Sender:
@@ -25,12 +30,14 @@ class Sender:
 
     async def close_card(self, msg_id, label: str, username: str | None = None):
         """Заменить кнопки карточки на итог («✅ Отправлено 14:32») и «Открыть чат»."""
+        await self.set_card_markup(msg_id, done_kb(label, username))
+
+    async def set_card_markup(self, msg_id, markup):
         if not msg_id:
             return   # карточка из старой версии или не дошла — менять нечего
         try:
             await self.bot.edit_message_reply_markup(
-                chat_id=self.mentor_user_id, message_id=msg_id,
-                reply_markup=done_kb(label, username),
+                chat_id=self.mentor_user_id, message_id=msg_id, reply_markup=markup,
             )
         except Exception:
             # карточку удалили или она уже с этим итогом — не повод ронять само действие
@@ -53,8 +60,13 @@ class Sender:
         bconn = await self.repo.get_setting("bconn")
         if not bconn:
             return "no_bconn"
-        await self.bot.send_message(
-            mentee["chat_id"], text, business_connection_id=bconn
-        )
+        try:
+            await self.bot.send_message(
+                mentee["chat_id"], text, business_connection_id=bconn
+            )
+        except TelegramBadRequest as e:
+            if any(code in str(e) for code in WINDOW_ERRORS):
+                return "window_closed"
+            raise
         await asyncio.sleep(2)
         return "sent"

@@ -1,12 +1,13 @@
 import logging
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
 from aiogram.types import CallbackQuery
 
 from mentor_bot.cards import NOOP, hhmm
 from mentor_bot.sheets import RowNotFound, SheetSchemaChanged, StatusConflict
-from mentor_bot.store.repo import SRC_BOT, SRC_BOT_EDIT
+from mentor_bot.store.repo import SRC_BOT, SRC_BOT_EDIT, UNTIL_REPLY
 from mentor_bot.style import todo_marks
 
 log = logging.getLogger(__name__)
@@ -28,7 +29,8 @@ async def _log_sent(repo, username: str, text: str, source: str):
 _DONE = {
     "sent": "✅ Отправлено", "dry": "🧪 Dry-run", "answered": "💬 Ответил в чате",
     "ignored": "🙈 Игнор", "stale": "⏭ Неактуален", "skipped": "⏭ Пропущен",
-    "expired": "⌛ Истёк", "sending": "⏳ Отправляется",
+    "expired": "⌛ Истёк", "sending": "⏳ Отправляется", "handoff": "➡️ Отправь сам",
+    "sent_manual": "✅ Отправил сам", "snoozed": "⏸ Отложен",
 }
 
 
@@ -199,18 +201,34 @@ async def handle_add_callback(data: str, repo, sender, service, card=None) -> st
 
 async def handle_p_callback(data: str, repo, sender, service, card=None) -> str:
     from mentor_bot.jobs import send_ping_draft
-    _, action, pid = data.split(":")
+    parts = data.split(":")
+    action, pid = parts[1], parts[2]
     d = await repo.get_ping_draft(int(pid))
     if not d:
         return "Уже обработано"
     card = d.get("card_msg_id") or card
-    if d["state"] != "open":
-        await sender.close_card(card, _DONE.get(d["state"], "✔️ Обработано"), d["username"])
+    user = d["username"]
+    if d["state"] not in ("open", "handoff") or (d["state"] == "handoff" and action in ("send", "edit")):
+        await sender.close_card(card, _DONE.get(d["state"], "✔️ Обработано"), user)
         return "Уже обработано"
-    if action == "skip":
-        await repo.set_ping_draft_state(d["id"], "skipped")
-        await sender.close_card(card, "⏭ Пропущен", d["username"])
-        return "Ок, этот пинг пропускаю"
+    now = datetime.now(timezone.utc)
+    if action in ("skip", "snooze"):
+        # «Пропустить» — до следующего обычного пинга, а не до завтра: раньше на следующий
+        # день готовился такой же черновик и тратился новый вызов модели
+        days = (int(parts[3]) if action == "snooze"
+                else getattr(service.settings, "ping_interval_days", 3))
+        until = now + timedelta(days=days)
+        await repo.set_pause(user, until.isoformat())
+        await repo.set_ping_draft_state(d["id"], "skipped" if action == "skip" else "snoozed")
+        day = until.astimezone(ZoneInfo(_tz(service))).strftime("%d.%m")
+        label = f"⏭ Пропущен до {day}" if action == "skip" else f"⏸ До {day}"
+        await sender.close_card(card, label, user)
+        return f"Ок, следующий пинг @{user} не раньше {day}"
+    if action == "until":
+        await repo.set_pause(user, UNTIL_REPLY)
+        await repo.set_ping_draft_state(d["id"], "snoozed")
+        await sender.close_card(card, "🔕 До ответа ученика", user)
+        return f"Ок, @{user} не пингую, пока сам не напишет"
     if action == "edit":
         await start_edit(repo, "p", d["id"])
         await sender.notify_mentor(
@@ -219,6 +237,23 @@ async def handle_p_callback(data: str, repo, sender, service, card=None) -> str:
         return "Жду текст"
     return (await send_ping_draft(d["id"], service, repo, sender, service.settings,
                                   card=card)).message
+
+
+async def handle_esc_callback(data: str, repo, sender, service, card=None) -> str:
+    """Ученик игнорит пинги: «Пинговать снова» обнуляет счётчик; «Через 14 дн» — то же,
+    но с паузой, чтобы следующий пинг пришёл не завтра."""
+    parts = data.split(":")
+    action, username = parts[1], parts[2]
+    await repo.reset_unanswered(username)
+    if action == "pause":
+        until = datetime.now(timezone.utc) + timedelta(days=int(parts[3]))
+        await repo.set_pause(username, until.isoformat())
+        day = until.astimezone(ZoneInfo(_tz(service))).strftime("%d.%m")
+        await sender.close_card(card, f"⏸ Пингую снова после {day}", username)
+        return f"Ок, @{username} снова пингую после {day}"
+    await repo.set_pause(username, None)
+    await sender.close_card(card, "🔁 Снова пингую", username)
+    return f"Ок, @{username} снова в пингах"
 
 
 def make_router(service, repo, sender) -> Router:
@@ -242,6 +277,10 @@ def make_router(service, repo, sender) -> Router:
     @router.callback_query(F.data.startswith("add:"))
     async def on_add(cb: CallbackQuery):
         await cb.answer(await handle_add_callback(cb.data, repo, sender, service, card(cb)))
+
+    @router.callback_query(F.data.startswith("esc:"))
+    async def on_esc(cb: CallbackQuery):
+        await cb.answer(await handle_esc_callback(cb.data, repo, sender, service, card(cb)))
 
     @router.callback_query(F.data == NOOP)
     async def on_noop(cb: CallbackQuery):

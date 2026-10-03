@@ -25,6 +25,13 @@ SRC_BOT = "bot"              # текст модели, отправленный
 SRC_BOT_EDIT = "bot_edit"    # правка ментора, отправленная ботом
 SRC_AUTO = "auto"            # автоответ Telegram Business или отложенное сообщение
 
+# paused_until «до ответа ученика»: пауза снимается первым же его сообщением
+UNTIL_REPLY = "9999-12-31T00:00:00+00:00"
+
+# ping_drafts.state, которые ещё ждут решения: 'open' — пинг на одобрение, 'handoff' — бот
+# не смог написать сам (окно 24 ч закрыто), ментор отправляет руками
+PING_WAITING = ("open", "handoff")
+
 # Образцы стиля ментора: короче — «ок», длиннее — простыня, по которой тон не поймать
 STYLE_MIN_CHARS = 15
 STYLE_MAX_CHARS = 600
@@ -255,6 +262,11 @@ class Repo:
     async def set_pause(self, username, until_iso):
         await self._exec("UPDATE mentees SET paused_until=? WHERE username=?", (until_iso, username))
 
+    async def clear_reply_pause(self, username):
+        """Ученик написал — пауза «до ответа» своё отработала."""
+        await self._exec("UPDATE mentees SET paused_until=NULL WHERE username=? AND paused_until=?",
+                         (username, UNTIL_REPLY))
+
     async def bump_unanswered(self, username):
         await self._exec(
             "UPDATE mentees SET unanswered_pings=unanswered_pings+1 WHERE username=?", (username,)
@@ -455,14 +467,16 @@ class Repo:
                        else ("username=?", (username,)))
         return await self._close("questions", "answered", where, args)
 
-    async def _close(self, table, state, where, args) -> list[dict]:
+    async def _close(self, table, state, where, args, states=("open",)) -> list[dict]:
+        marks = ",".join("?" * len(states))
         async with self._tx() as c:
             cur = await c.execute(
-                f"SELECT id, card_msg_id FROM {table} WHERE {where} AND state='open'", args
+                f"SELECT id, card_msg_id, username FROM {table} "
+                f"WHERE {where} AND state IN ({marks})", args + tuple(states)
             )
             rows = [dict(r) for r in await cur.fetchall()]
-            await c.execute(f"UPDATE {table} SET state=? WHERE {where} AND state='open'",
-                            (state,) + args)
+            await c.execute(f"UPDATE {table} SET state=? WHERE {where} AND state IN ({marks})",
+                            (state,) + args + tuple(states))
         return rows
 
     async def set_card(self, table, rid, msg_id):
@@ -634,10 +648,21 @@ class Repo:
         return await self._one("SELECT * FROM ping_drafts WHERE id=?", (pid,))
 
     async def open_ping_draft(self, username):
+        """Пинг ученику, который ещё ждёт ментора: на одобрении или на ручной отправке."""
         return await self._one(
-            "SELECT * FROM ping_drafts WHERE username=? AND state='open' ORDER BY id DESC LIMIT 1",
+            "SELECT * FROM ping_drafts WHERE username=? AND state IN ('open', 'handoff') "
+            "ORDER BY id DESC LIMIT 1",
             (username,),
         )
+
+    async def set_ping_draft_text(self, pid, text):
+        await self._exec("UPDATE ping_drafts SET text=? WHERE id=?", (text, pid))
+
+    async def expire_ping_drafts(self, before_iso) -> list[dict]:
+        """Ждущие пинги старше before_iso — в 'expired'. Забытый черновик раньше навсегда
+        блокировал пинги ученику: новый не готовился, пока висит старый."""
+        return await self._close("ping_drafts", "expired", "created_ts < ?", (before_iso,),
+                                 states=PING_WAITING)
 
     async def claim(self, table, rid, state="sending") -> bool:
         """Атомарно забрать запись open → state. Два быстрых нажатия «Отправить» обрабатываются
@@ -651,9 +676,9 @@ class Repo:
     async def set_ping_draft_state(self, pid, state):
         await self._exec("UPDATE ping_drafts SET state=? WHERE id=?", (state, pid))
 
-    async def close_ping_drafts(self, username, state="stale") -> list[dict]:
-        """Закрыть ждущие пинги ученика; возвращает закрытые [{id, card_msg_id}]."""
-        return await self._close("ping_drafts", state, "username=?", (username,))
+    async def close_ping_drafts(self, username, state="stale", states=PING_WAITING) -> list[dict]:
+        """Закрыть ждущие пинги ученика; возвращает закрытые [{id, card_msg_id, username}]."""
+        return await self._close("ping_drafts", state, "username=?", (username,), states=states)
 
     # interview_notes — вопросы с собесов, которые пересказал ученик
     async def add_interview_notes(self, username, source_ts, items, embs, emb_model=None):
