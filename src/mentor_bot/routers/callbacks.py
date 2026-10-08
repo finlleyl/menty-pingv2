@@ -5,7 +5,9 @@ from zoneinfo import ZoneInfo
 from aiogram import F, Router
 from aiogram.types import CallbackQuery
 
+from mentor_bot.calls import GRACE, call_kb
 from mentor_bot.cards import NOOP, UNCERTAIN_LABEL, hhmm
+from mentor_bot.pings import parse_iso_utc
 from mentor_bot.sheets import RowNotFound, SheetSchemaChanged, StatusConflict
 from mentor_bot.store.repo import SRC_BOT, SRC_BOT_EDIT, UNTIL_REPLY
 from mentor_bot.style import todo_marks
@@ -280,6 +282,36 @@ async def handle_esc_callback(data: str, repo, sender, service, card=None) -> st
     return f"Ок, @{username} снова в пингах"
 
 
+async def handle_call_callback(data: str, repo, sender, service, card=None) -> str:
+    """🗑 убирает созвон из календаря, ↩️ возвращает. card — нажатая карточка: кнопки меняем
+    на ней."""
+    _, action, cid = data.split(":")
+    c = await repo.get_call(int(cid))
+    if not c:
+        return "Уже обработано"
+    user = c["username"]
+    card = card or c.get("card_msg_id")
+    now = datetime.now(timezone.utc)
+    if action == "del":
+        if c["state"] == "active":
+            await repo.set_call_state(c["id"], "cancelled", now.isoformat())
+        await sender.set_card_markup(card, call_kb(c["id"], user, active=False))
+        return "Убрал из календаря"
+    if c["state"] == "active":
+        await sender.set_card_markup(card, call_kb(c["id"], user))
+        return "Уже в календаре"
+    if parse_iso_utc(c["starts_at"]) < now - GRACE:
+        return "Время этого созвона уже прошло"
+    other = await repo.upcoming_call(user, (now - GRACE).isoformat())
+    if other and other["id"] != c["id"]:
+        return f"У @{user} уже записан другой созвон — сначала удали его"
+    await repo.set_call_state(c["id"], "active", now.isoformat())
+    # кнопки «Удалить» теперь на этой карточке: перенос закроет именно её
+    await repo.set_card("calls", c["id"], card)
+    await sender.set_card_markup(card, call_kb(c["id"], user))
+    return "Вернул в календарь"
+
+
 def make_router(service, repo, sender) -> Router:
     router = Router()
 
@@ -305,6 +337,10 @@ def make_router(service, repo, sender) -> Router:
     @router.callback_query(F.data.startswith("esc:"))
     async def on_esc(cb: CallbackQuery):
         await cb.answer(await handle_esc_callback(cb.data, repo, sender, service, card(cb)))
+
+    @router.callback_query(F.data.startswith("call:"))
+    async def on_call(cb: CallbackQuery):
+        await cb.answer(await handle_call_callback(cb.data, repo, sender, service, card(cb)))
 
     @router.callback_query(F.data == NOOP)
     async def on_noop(cb: CallbackQuery):

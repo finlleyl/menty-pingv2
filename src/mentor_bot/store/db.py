@@ -9,7 +9,8 @@ CREATE TABLE IF NOT EXISTS mentees(
   paused_until TEXT,
   unanswered_pings INTEGER NOT NULL DEFAULT 0,
   status_since TEXT,
-  last_status TEXT
+  last_status TEXT,
+  calls_seen_id INTEGER     -- до какого сообщения переписка проверена на договорённости о созвонах
 );
 -- source: 'chat' — написано в Telegram руками (ментором или учеником); 'bot' — текст модели,
 -- отправленный ботом (пинг, черновик как есть); 'bot_edit' — правка ментора, отправленная ботом;
@@ -122,6 +123,22 @@ CREATE TABLE IF NOT EXISTS llm_usage(
   cost REAL
 );
 CREATE INDEX IF NOT EXISTS idx_llm_usage_ts ON llm_usage(ts);
+-- календарь созвонов с учениками (calls.py). starts_at — UTC ISO; state: 'active' или
+-- 'cancelled'; source: 'chat' — договорённость нашёл бот в переписке, 'manual' — команда /call
+CREATE TABLE IF NOT EXISTS calls(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  username TEXT NOT NULL,
+  starts_at TEXT NOT NULL,
+  kind TEXT NOT NULL,       -- 'sprint' — собес по спринту, 'mock' — мок-собес, 'other'
+  sprint INTEGER,
+  state TEXT NOT NULL DEFAULT 'active',
+  source TEXT NOT NULL,
+  quote TEXT,               -- реплика, которой договорились: видно, откуда бот это взял
+  created_ts TEXT NOT NULL,
+  updated_ts TEXT NOT NULL,
+  card_msg_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_calls_state_starts ON calls(state, starts_at);
 -- журнал фоновых задач для /health: когда последний раз запускалась, прошла, упала
 CREATE TABLE IF NOT EXISTS job_runs(
   job TEXT PRIMARY KEY,

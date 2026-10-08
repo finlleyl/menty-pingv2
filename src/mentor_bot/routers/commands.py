@@ -7,6 +7,7 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.types import Message
 
+from mentor_bot.calls import handle_call, week_text
 from mentor_bot.pings import effective_last_contact, should_ping
 from mentor_bot.routers.callbacks import EDIT_KEY, handle_edit_text
 
@@ -14,6 +15,8 @@ _bg_tasks: set = set()
 
 HELP = (
     "/status — сводка\n/health — всё ли работает: подключение, LLM, задачи, очередь\n/digest — недельная сводка по воронке\n/fails — на чём срезаются на собесах\n"
+    "/week [дней] — созвоны на неделю\n"
+    "/call @user 15.10 19:00 [спринт 2|мок] — записать созвон; /call @user отмена — убрать\n"
     "/pause @user N — пауза пингов\n/pause_all, /resume_all — стоп-кран\n"
     "/dryrun on|off — тестовый режим\n/pingmode auto|review — пинги сами или через тебя\n"
     "/cost [дней] — расходы на LLM\n/backup — бэкап базы файлом\n"
@@ -165,6 +168,18 @@ def make_router(service, repo, sender, settings, reindex_fn, backup_fn=None) -> 
     async def cmd_fails(message: Message):
         from mentor_bot.digest import fails_text
         await message.answer(await fails_text(repo, model=settings.embed_model))
+
+    @router.message(Command("week"))
+    async def cmd_week(message: Message):
+        await message.answer(await week_text(args_of(message), repo, settings,
+                                             datetime.now(timezone.utc)))
+
+    @router.message(Command("call"))
+    async def cmd_call(message: Message):
+        reply = await handle_call(args_of(message), service, repo, sender,
+                                  datetime.now(timezone.utc))
+        if reply:
+            await message.answer(reply)
 
     @router.message(Command("pingmode"))
     async def cmd_pingmode(message: Message):

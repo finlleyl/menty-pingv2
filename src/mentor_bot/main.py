@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher
 
+from mentor_bot.calls import calls_cycle, calls_morning, morning_due
 from mentor_bot.cards import UNCERTAIN_LABEL
 from mentor_bot.config import load_settings
 from mentor_bot.jobs import (
@@ -119,6 +120,8 @@ async def main():
         "dossier_cycle": (dossier_cycle, [service, repo, llm, sender, settings], {}),
         "digest_cycle": (digest_cycle, [service, repo, sender, settings], {}),
         "nightly_backup": (nightly_backup, [], {}),
+        "calls_cycle": (calls_cycle, [service, repo, llm, sender, settings], {}),
+        "calls_morning": (calls_morning, [repo, sender, settings], {}),
     }
 
     def add(name, trigger, **kw):
@@ -134,6 +137,10 @@ async def main():
         hour=settings.digest_hour, minute=3, **rare)
     if settings.backup_hour >= 0:
         add("nightly_backup", "cron", hour=settings.backup_hour, minute=41, **rare)
+    # на полминуты позже разбора сообщений: обе задачи ходят в модель, не толкаемся
+    add("calls_cycle", "cron", minute="*", second=30)
+    if settings.calls_hour >= 0:
+        add("calls_morning", "cron", hour=settings.calls_hour, minute=2, **rare)
 
     def on_missed(event):
         # пропуск всё же случился (простой дольше допуска) — пусть будет виден в /health
@@ -142,7 +149,11 @@ async def main():
     scheduler.add_listener(on_missed, EVENT_JOB_MISSED)
     scheduler.start()
     # бот лежал, когда должна была пройти редкая задача, — догоняем сразу после старта
-    for name in due_catch_ups(await repo.job_runs(), datetime.now(timezone.utc)):
+    now = datetime.now(timezone.utc)
+    due = due_catch_ups(await repo.job_runs(), now)
+    if settings.calls_hour >= 0 and await morning_due(repo, settings, now):
+        due.append("calls_morning")   # сводка суточная, а не «раз в N часов»: своя проверка
+    for name in due:
         if scheduler.get_job(name):
             log.info("catching up missed job %s", name)
             scheduler.get_job(name).modify(next_run_time=datetime.now(tz) + timedelta(minutes=1))

@@ -1,11 +1,13 @@
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 import openai
 from pydantic import BaseModel
 
+from mentor_bot.cards import day_label
+from mentor_bot.pings import parse_iso_utc
 from mentor_bot.stages import STAGE_LABELS, parse_stage, ping_topics
 
 log = logging.getLogger(__name__)
@@ -41,6 +43,15 @@ class InterviewItem(BaseModel):
 
 class InterviewReport(BaseModel):
     items: list[InterviewItem]
+
+
+class CallUpdate(BaseModel):
+    action: Literal["none", "scheduled", "cancelled"]
+    date: str | None           # YYYY-MM-DD — строка из календаря в запросе
+    time: str | None           # HH:MM по часовому поясу ментора
+    kind: Literal["sprint", "mock", "other"] | None
+    sprint: int | None
+    quote: str                 # реплика, которой договорились или отменили
 
 
 TRIAGE_SYS = (
@@ -276,6 +287,59 @@ def looks_like_interview(text: str) -> bool:
     return bool(_INTERVIEW_RE.search(text or ""))
 
 
+CALL_SYS = (
+    "Ты ведёшь календарь ментора по Go-разработке и по его переписке с учеником отмечаешь "
+    "созвоны ментора С ЭТИМ учеником: собеседование по итогам спринта (спринты 1-4) и мок-собес "
+    "по легенде. Собеседования ученика в компаниях, звонки HR и рекрутеров - не созвоны с "
+    "ментором, их не отмечай.\n"
+    "action:\n"
+    "- scheduled: в НОВЫХ сообщениях договорились о конкретном дне и времени созвона или "
+    "перенесли уже записанный. Договорились - это одна сторона назвала день и время, а другая "
+    "согласилась; ментор спросил, когда удобно, и ученик назвал день и время; или ментор сам "
+    "назначил время. Вопрос без ответа («в чт в 19 удобно?»), «на неделе созвонимся», день без "
+    "часа - ещё не договорились, это none.\n"
+    "- cancelled: в новых сообщениях записанный созвон отменили, а нового времени не назначили.\n"
+    "- none: всё остальное, в том числе когда новые сообщения только подтверждают уже "
+    "записанный созвон («ок, до завтра») или о созвонах в них ничего нет.\n"
+    "date: день созвона в формате YYYY-MM-DD. Бери его из календаря в запросе, не высчитывай "
+    "сам. «Завтра», «в четверг» считай от даты сообщения, в котором это сказано (она в "
+    "квадратных скобках перед репликой): день недели - ближайший такой день после этой даты "
+    "или сама эта дата, если названное время в тот день ещё не прошло.\n"
+    "time: HH:MM по часовому поясу ментора. Час без «утра» и «вечера»: 1-8 - это день и вечер "
+    "(«в 7» - 19:00, «в 2» - 14:00), 9-12 - как есть. Назван другой часовой пояс - переведи "
+    "в пояс ментора.\n"
+    "kind: sprint - собеседование по спринту, mock - мок-собес, other - другой созвон с "
+    "ментором. sprint - номер спринта, если он виден из переписки, иначе null.\n"
+    "Для none и cancelled date и time - null. quote - реплика, которой договорились или "
+    "отменили, дословно и не длиннее 100 символов; для none - пустая строка."
+)
+
+CALL_DAYS_AHEAD = 21   # на сколько дней вперёд календарь в запросе: «через две недели в пт»
+
+
+def _stamped(msgs: list[dict], tz) -> str:
+    """Переписка с датой у каждой реплики: «завтра», сказанное вчера, — это сегодня."""
+    out = []
+    for m in msgs:
+        at = parse_iso_utc(m["ts"]).astimezone(tz)
+        who = "Ученик" if m["direction"] == "in" else "Ментор"
+        out.append(f"[{day_label(at)} {at:%H:%M}] {who}: {m['text']}")
+    return "\n".join(out)
+
+
+def _call_calendar(first, today) -> str:
+    """«чт 15.10 → 2026-10-15»: день модель находит строкой, а не считает — в арифметике
+    дат она ошибается чаще, чем в чтении таблицы."""
+    lines = []
+    d = first
+    while d <= today + timedelta(days=CALL_DAYS_AHEAD):
+        note = (" (сегодня)" if d == today
+                else " (завтра)" if d == today + timedelta(days=1) else "")
+        lines.append(f"{day_label(d)} → {d.isoformat()}{note}")
+        d += timedelta(days=1)
+    return "\n".join(lines)
+
+
 LLM_TIMEOUT = 90.0   # секунд на запрос к модели; длиннее — считаем провайдера недоступным
 
 
@@ -487,6 +551,26 @@ class LLM:
 
     async def extract_interview(self, text: str) -> InterviewReport:
         return await self._parse(self.fast, INTERVIEW_SYS, text, InterviewReport, "interview")
+
+    async def extract_call(self, earlier: list[dict], new: list[dict], *, now_local: datetime,
+                           status: str | None = None, booked: str | None = None) -> CallUpdate:
+        """Договорились ли в новых сообщениях о созвоне с ментором: день, время, повод.
+        booked — уже записанный предстоящий созвон («пт 09.10 в 19:00, собес по спринту 2»):
+        с ним модель отличит перенос и отмену от подтверждения. Ошибка в дне стоит ментору
+        пропущенного созвона, поэтому модель умная: вызовов мало, их отсекает предфильтр."""
+        tz = now_local.tzinfo
+        today = now_local.date()
+        first = min([parse_iso_utc(m["ts"]).astimezone(tz).date() for m in earlier + new]
+                    + [today])
+        user = (
+            f"Сейчас: {day_label(today)} {now_local:%H:%M}, часовой пояс ментора {tz}\n"
+            f"Статус ученика в таблице: «{status or 'нет'}»\n"
+            f"Уже записан созвон: {booked or 'нет'}\n\n"
+            f"Календарь:\n{_call_calendar(first, today)}\n\n"
+            f"Переписка до новых сообщений:\n{_stamped(earlier, tz) or 'нет'}\n\n"
+            f"НОВЫЕ сообщения:\n{_stamped(new, tz)}"
+        )
+        return await self._parse(self.smart, CALL_SYS, user, CallUpdate, "call")
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         try:

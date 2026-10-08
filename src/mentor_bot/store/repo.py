@@ -132,9 +132,17 @@ async def _m5_cards(conn):
     await _add_column(conn, "proposals", "created_ts", "TEXT")
 
 
-MIGRATIONS = (_m1_legacy_columns, _m2_pending_rows, _m3_embeddings, _m4_message_ids, _m5_cards)
+async def _m6_calls(conn):
+    """Календарь созвонов: докуда переписка ученика проверена на договорённости. Таблицу calls
+    создаёт SCHEMA. Пустая отметка — проверим последние дни переписки: созвоны, о которых
+    договорились до обновления бота, тоже попадут в календарь."""
+    await _add_column(conn, "mentees", "calls_seen_id", "INTEGER")
 
-CARD_TABLES = ("questions", "ping_drafts", "proposals")
+
+MIGRATIONS = (_m1_legacy_columns, _m2_pending_rows, _m3_embeddings, _m4_message_ids, _m5_cards,
+              _m6_calls)
+
+CARD_TABLES = ("questions", "ping_drafts", "proposals", "calls")
 
 
 class Repo:
@@ -762,6 +770,68 @@ class Repo:
     async def close_ping_drafts(self, username, state="stale", states=PING_WAITING) -> list[dict]:
         """Закрыть ждущие пинги ученика; возвращает закрытые [{id, card_msg_id, username}]."""
         return await self._close("ping_drafts", state, "username=?", (username,), states=states)
+
+    # calls — календарь созвонов с учениками (calls.py). Время — UTC ISO: сравнивается строками
+    async def add_call(self, username, starts_at, kind, sprint, source, quote, ts_iso) -> int:
+        cur = await self._exec(
+            "INSERT INTO calls(username, starts_at, kind, sprint, source, quote, created_ts, "
+            "updated_ts) VALUES (?,?,?,?,?,?,?,?)",
+            (username, starts_at, kind, sprint, source, quote, ts_iso, ts_iso),
+        )
+        return cur.lastrowid
+
+    async def get_call(self, cid):
+        return await self._one("SELECT * FROM calls WHERE id=?", (cid,))
+
+    async def update_call(self, cid, starts_at, kind, sprint, source, quote, ts_iso):
+        await self._exec(
+            "UPDATE calls SET starts_at=?, kind=?, sprint=?, source=?, quote=?, updated_ts=? "
+            "WHERE id=?",
+            (starts_at, kind, sprint, source, quote, ts_iso, cid),
+        )
+
+    async def set_call_state(self, cid, state, ts_iso):
+        await self._exec("UPDATE calls SET state=?, updated_ts=? WHERE id=?", (state, ts_iso, cid))
+
+    async def upcoming_call(self, username, since_iso):
+        """Ближайший записанный созвон ученика, который начинается не раньше since_iso."""
+        return await self._one(
+            "SELECT * FROM calls WHERE username=? AND state='active' AND starts_at >= ? "
+            "ORDER BY starts_at LIMIT 1",
+            (username, since_iso),
+        )
+
+    async def calls_between(self, from_iso, to_iso):
+        return await self._all(
+            "SELECT * FROM calls WHERE state='active' AND starts_at >= ? AND starts_at < ? "
+            "ORDER BY starts_at, username",
+            (from_iso, to_iso),
+        )
+
+    async def calls_unseen(self):
+        """Чаты, где после прошлой проверки на договорённости о созвоне есть новые сообщения:
+        [{username, max_id, last_ts, seen_id}]. last_ts — самое свежее сообщение чата."""
+        return await self._all(
+            "SELECT m.username, MAX(m.id) AS max_id, MAX(m.ts) AS last_ts, "
+            "COALESCE(t.calls_seen_id, 0) AS seen_id FROM messages m "
+            "LEFT JOIN mentees t ON t.username = m.username "
+            "GROUP BY m.username HAVING MAX(m.id) > COALESCE(t.calls_seen_id, 0)"
+        )
+
+    async def call_window(self, username, since_iso, limit):
+        """Переписка с since_iso, не больше limit последних сообщений, по порядку. Автоответы
+        Business («меня нет до понедельника») — не договорённость: их модель не видит."""
+        rows = await self._all(
+            "SELECT id, direction, text, ts FROM messages WHERE username=? AND ts >= ? "
+            f"AND source != '{SRC_AUTO}' ORDER BY ts DESC, id DESC LIMIT ?",
+            (username, since_iso, limit),
+        )
+        return list(reversed(rows))
+
+    async def set_calls_seen(self, username, msg_id):
+        # только UPDATE: строку mentees заводит бизнес-роутер, и по её отсутствию он спрашивает
+        # «Новый чат — добавить?». Заведи её отметка раньше — вопрос пропал бы
+        await self._exec("UPDATE mentees SET calls_seen_id=? WHERE username=?", (msg_id, username))
 
     # interview_notes — вопросы с собесов, которые пересказал ученик
     async def add_interview_notes(self, username, source_ts, items, embs, emb_model=None):

@@ -12,6 +12,7 @@ log = logging.getLogger(__name__)
 JOB_LABELS = {
     "ping_cycle": "пинги", "remind_cycle": "напоминания", "drain_pending": "разбор сообщений",
     "dossier_cycle": "досье", "digest_cycle": "сводка", "nightly_backup": "бэкап",
+    "calls_cycle": "созвоны из переписки", "calls_morning": "утренние созвоны",
 }
 
 # Задачи, которые жалко пропустить из-за простоя: если последний успешный запуск старше

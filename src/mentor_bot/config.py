@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     backup_hour: int = 4          # -1 — ночной бэкап выключен
     digest_weekday: str = "mon"   # день недельной сводки (mon..sun)
     digest_hour: int = 10
+    calls_hour: int = 9           # утренняя сводка созвонов на сегодня и завтра; -1 — выключена
     stop_statuses: str = "умер,оффер,приостановил,договор,ушел,ушёл,на стопе"
     log_level: str = "INFO"
     # точные заголовки колонок (регистр не важен), если бот путает их сам; пусто — угадывает

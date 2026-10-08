@@ -38,6 +38,14 @@ def hhmm(tz_name: str, now: datetime | None = None) -> str:
     return (now or datetime.now(timezone.utc)).astimezone(ZoneInfo(tz_name)).strftime("%H:%M")
 
 
+WEEKDAYS = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
+
+
+def day_label(d) -> str:
+    """«чт 08.10» — день недели рядом с датой: договариваются «в четверг», а не «8-го»."""
+    return f"{WEEKDAYS[d.weekday()]} {d:%d.%m}"
+
+
 def escalation_kb(username: str) -> InlineKeyboardMarkup:
     """Ученик игнорит пинги: пинговать снова, отложить на две недели или написать самому."""
     return InlineKeyboardMarkup(inline_keyboard=[
